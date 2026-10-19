@@ -18,7 +18,7 @@
 #include <math.h>
 #include <wchar.h>
 
-#define RR_VERSION "0.3.2"
+#define RR_VERSION "0.4.0"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -101,6 +101,23 @@ static const short SIG_DISPATCH[] = {
 };
 #define DISPATCH_STOLEN 15
 
+// A distribution office (building type 0x34) hands a train wagons in groups in
+// FUN_14068b330: train length (lead + wagons) against the length of its track,
+// then `call FUN_1403e5a00(group wagon type)` for the room a group needs:
+//   mov rcx,[r13|r15+0x1708]; call <room>; comiss xmm1,xmm0; ja <couple>; mov [rbp+0x368],sil|dil (full)
+// The lead is at [rbp+0x340] there (the function's first argument, spilled).
+// Both calls are redirected: a locomotive with its hub limit reached gets "no
+// room", so the office treats the train as full.
+static const short SIG_ROOM_A[] = {
+    0x49,0x8b,0x8d,0x08,0x17,0x00,0x00, 0xe8,-1,-1,-1,-1, 0x0f,0x2f,0xc8, 0x77,0x13, 0x40,0x88,0xb5,0x68,0x03,0x00,0x00,
+};
+static const short SIG_ROOM_B[] = {
+    0x49,0x8b,0x8f,0x08,0x17,0x00,0x00, 0xe8,-1,-1,-1,-1, 0x0f,0x2f,0xc8, 0x77,0x22, 0x40,0x88,0xbd,0x68,0x03,0x00,0x00,
+};
+#define ROOM_CALL_AT 7            // the e8 in both
+
+#define HUB_LIMIT_MAX  10
+
 // The game's list of every vehicle, in save order: vehicles.bin is written by
 // walking it and read back into it in the same order.
 // mov rax,[rip+end]; mov rcx,[rip+begin]; ... call <read vehicle>; mov [rbx+4],edi
@@ -151,7 +168,7 @@ static struct {
     float indicatorX, indicatorY;   // offset from that corner, % of the screen width / height
     int   fontScale;        // indicator font, % of the default UI font
     int   outline;          // outline width, px
-    Key   keyTrain, keyFreight, keyPassenger;
+    Key   keyTrain, keyFreight, keyPassenger, keyLimitUp, keyLimitDown, keyLimitReset;
 } cfg;
 
 // A train pushes after a reversal if it was chosen in its window, or if every
@@ -172,9 +189,48 @@ static bool ParseKey(const char* s, Key* k)
         else if ((tok[0] == 'F' || tok[0] == 'f') && atoi(tok + 1) >= 1 && atoi(tok + 1) <= 12) k->vk = VK_F1 + atoi(tok + 1) - 1;
         else if (!tok[1] && ((tok[0] >= 'A' && tok[0] <= 'Z') || (tok[0] >= '0' && tok[0] <= '9'))) k->vk = tok[0];
         else if (!tok[1] && tok[0] >= 'a' && tok[0] <= 'z') k->vk = tok[0] - 32;
+        else if (!_stricmp(tok, "MINUS")) k->vk = VK_OEM_MINUS;              // the -_ key
+        else if (!_stricmp(tok, "PLUS") || !_stricmp(tok, "EQUALS")) k->vk = VK_OEM_PLUS;   // the =+ key
+        else if (!_stricmp(tok, "NUMPADMINUS")) k->vk = VK_SUBTRACT;
+        else if (!_stricmp(tok, "NUMPADPLUS")) k->vk = VK_ADD;
         else return false;
     }
     return k->vk != 0;
+}
+
+// A key's own name as the indicator shows it ("F9", "-", "+"; the game font
+// has no U+2212, so the plain hyphen).
+static void KeyName(const Key* k, wchar_t* out, size_t cap)
+{
+    if (k->vk >= VK_F1 && k->vk <= VK_F12) swprintf(out, cap, L"F%d", k->vk - VK_F1 + 1);
+    else if (k->vk == VK_OEM_MINUS) swprintf(out, cap, L"-");
+    else if (k->vk == VK_OEM_PLUS)  swprintf(out, cap, L"+");
+    else if (k->vk == VK_SUBTRACT)  swprintf(out, cap, L"Num -");
+    else if (k->vk == VK_ADD)       swprintf(out, cap, L"Num +");
+    else swprintf(out, cap, L"%c", (wchar_t)k->vk);
+}
+
+// Its modifiers, joined by sep: "Ctrl+Shift+" or "Ctrl Shift ".
+static void KeyMods(const Key* k, const wchar_t* sep, wchar_t* out, size_t cap)
+{
+    swprintf(out, cap, L"%ls%ls%ls%ls%ls%ls", k->ctrl ? L"Ctrl" : L"", k->ctrl ? sep : L"",
+             k->shift ? L"Shift" : L"", k->shift ? sep : L"", k->alt ? L"Alt" : L"", k->alt ? sep : L"");
+}
+
+// "Ctrl+F9" for the F-keys and the like; "Ctrl Shift -" where a "+" in the
+// name would read as a separator.
+static void KeyText(const Key* k, wchar_t* out, size_t cap)
+{
+    wchar_t mods[32], name[16];
+    bool sym = k->vk == VK_OEM_MINUS || k->vk == VK_OEM_PLUS || k->vk == VK_SUBTRACT || k->vk == VK_ADD;
+    KeyMods(k, sym ? L" " : L"+", mods, 32);
+    KeyName(k, name, 16);
+    swprintf(out, cap, L"%ls%ls", mods, name);
+}
+
+static bool SameMods(const Key* a, const Key* b)
+{
+    return a->ctrl == b->ctrl && a->shift == b->shift && a->alt == b->alt;
 }
 
 static bool Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
@@ -214,7 +270,8 @@ static bool Pressed(const Key* k, int* latch)
 //              consist or a depot settles it again.
 struct Train { BYTE* lead; BYTE* type; INT_PTR wagons; int pushing; int chosen; int turned;
                int hasPose; float pose[4];          // model position + heading, for Resolve
-               float last[5]; int lastTurn; };     // the last setTransform arguments
+               float last[5]; int lastTurn;        // the last setTransform arguments
+               int hubLimit; };                     // most wagons a distribution office hands it, 0 = no limit
 #define TRAIN_SLOTS 4096
 static Train    g_trains[TRAIN_SLOTS];
 static int      g_trainCount;
@@ -244,7 +301,7 @@ static void Compact(void)                 // caller holds g_lock; keep only trai
     static Train keep[TRAIN_SLOTS];
     int n = 0;
     for (int i = 0; i < TRAIN_SLOTS; ++i)
-        if (g_trains[i].lead && (g_trains[i].pushing || g_trains[i].chosen)) keep[n++] = g_trains[i];
+        if (g_trains[i].lead && (g_trains[i].pushing || g_trains[i].chosen || g_trains[i].hubLimit)) keep[n++] = g_trains[i];
     memset(g_trains, 0, sizeof(g_trains));
     g_trainCount = 0;
     for (int k = 0; k < n; ++k) {
@@ -436,11 +493,86 @@ static void HookFlip(BYTE* lead, char routeMode, char extend)
     }
 }
 
+// ---------------------------------------------------------------- distribution offices
+// Hub limit. The office's "room for one more group" (FUN_1403e5a00), asked
+// for this lead; "no room" once it already has its limit.
+typedef float (*FnRoom)(BYTE* type);
+static FnRoom g_room;
+
+// group: the cut of wagons the office is about to couple - a stored vehicle
+// heading its own wagons (r13 at the first call site, r15 at the second; both
+// are what the office passes to FUN_14067e780 just before). It goes on whole,
+// so the limit counts it in full; a train still without wagons always gets
+// its first group, or it would leave empty.
+extern "C" float RR_Room(BYTE* type, BYTE* lead, BYTE* group)
+{
+    float room = g_room(type);
+    if (!lead || !g_trainCount) return room;
+    int limit = 0;
+    EnterCriticalSection(&g_lock);
+    Train* t = Find(lead);
+    if (t && t->type == *(BYTE**)(lead + V_TYPE)) limit = t->hubLimit;
+    LeaveCriticalSection(&g_lock);
+    if (limit <= 0) return room;
+    INT_PTR wagons = (*(BYTE**)(lead + V_WAGONS_END) - *(BYTE**)(lead + V_WAGONS_BEGIN)) / 8;
+    BYTE** gw = 0;
+    int n = group ? Wagons(group, &gw) : -1;
+    int groupSize = n >= 0 ? n + 1 : 1;
+    if (wagons == 0 || wagons + groupSize <= limit) return room;
+    static BYTE* lastFull;
+    if (lastFull != lead) {
+        lastFull = lead;
+        Logf("railreverse  train %p: %d wagons + a group of %d is over its hub limit (%d): the office hands it no more",
+             lead, (int)wagons, groupSize, limit);
+    }
+    return 1e30f;
+}
+
+// Between the office's call and RR_Room. The office keeps values in xmm1 and
+// other volatile registers across this call (the compiler knew the callee),
+// so all of them are saved; the lead is read off the office's frame
+// ([rbp+0x340], FUN_14068b330's first argument), the group from GROUPREG.
+#define ROOM_THUNK(NAME, GROUPREG)                         \
+extern "C" __attribute__((naked)) void NAME(void)          \
+{                                                          \
+    __asm__ volatile(                                      \
+        "sub $0xa8, %rsp\n\t"                              \
+        "movdqu %xmm1, 0x20(%rsp)\n\t"                     \
+        "movdqu %xmm2, 0x30(%rsp)\n\t"                     \
+        "movdqu %xmm3, 0x40(%rsp)\n\t"                     \
+        "movdqu %xmm4, 0x50(%rsp)\n\t"                     \
+        "movdqu %xmm5, 0x60(%rsp)\n\t"                     \
+        "mov %rcx, 0x70(%rsp)\n\t"                         \
+        "mov %rdx, 0x78(%rsp)\n\t"                         \
+        "mov %r8, 0x80(%rsp)\n\t"                          \
+        "mov %r9, 0x88(%rsp)\n\t"                          \
+        "mov %r10, 0x90(%rsp)\n\t"                         \
+        "mov %r11, 0x98(%rsp)\n\t"                         \
+        "mov 0x340(%rbp), %rdx\n\t"                        \
+        "mov %" GROUPREG ", %r8\n\t"                       \
+        "call RR_Room\n\t"                                 \
+        "movdqu 0x20(%rsp), %xmm1\n\t"                     \
+        "movdqu 0x30(%rsp), %xmm2\n\t"                     \
+        "movdqu 0x40(%rsp), %xmm3\n\t"                     \
+        "movdqu 0x50(%rsp), %xmm4\n\t"                     \
+        "movdqu 0x60(%rsp), %xmm5\n\t"                     \
+        "mov 0x70(%rsp), %rcx\n\t"                         \
+        "mov 0x78(%rsp), %rdx\n\t"                         \
+        "mov 0x80(%rsp), %r8\n\t"                          \
+        "mov 0x88(%rsp), %r9\n\t"                          \
+        "mov 0x90(%rsp), %r10\n\t"                         \
+        "mov 0x98(%rsp), %r11\n\t"                         \
+        "add $0xa8, %rsp\n\t"                              \
+        "ret\n\t");                                        \
+}
+ROOM_THUNK(RR_RoomThunkA, "r13")
+ROOM_THUNK(RR_RoomThunkB, "r15")
+
 // ---------------------------------------------------------------- saves
 // railreverse.txt beside vehicles.bin:
 //   freight 0|1
 //   passenger 0|1
-//   <index in the vehicle list> <flags: 1 pushing, 2 chosen, 4 locomotive turned round> <type folder>
+//   <index in the vehicle list> <flags: 1 pushing, 2 chosen, 4 locomotive turned round, hub limit << 8> <type folder>
 // The index is stable because the game writes and reads the list in the same
 // order; the type folder guards against a stale file. The save itself is
 // never touched.
@@ -507,14 +639,14 @@ static void SaveSidecar(const char* vehiclesBin)
         BYTE* parent = 0;
         if (!v || !Rd(v, V_PARENT, &parent) || parent) continue;
         Train* t = Find(v);
-        if (!t || (!t->pushing && !t->chosen)) continue;
+        if (!t || (!t->pushing && !t->chosen && !t->hubLimit)) continue;
         BYTE* type; INT_PTR wagons;
         if (!Fingerprint(v, &type, &wagons) || type != t->type) continue;
         int pushing = t->pushing && wagons == t->wagons;                  // consist changed: saved as pulling
         char name[TYPE_NAME_MAX];
         TypeName(v, name);
         len += _snprintf_s(buf + len, sizeof(buf) - len, _TRUNCATE, "%d %d %s\n", i,
-                           (pushing ? 1 : 0) | (t->chosen ? 2 : 0) | (t->turned && pushing == t->pushing ? 4 : 0), name);
+                           (pushing ? 1 : 0) | (t->chosen ? 2 : 0) | (t->turned && pushing == t->pushing ? 4 : 0) | (t->hubLimit << 8), name);
         ++trains;
     }
     LeaveCriticalSection(&g_lock);
@@ -606,6 +738,8 @@ static void RestorePending(void)
         if (!t) continue;
         t->chosen = (p->flags & 2) ? 1 : 0;
         t->turned = (p->flags & 4) ? 1 : 0;
+        t->hubLimit = (p->flags >> 8) & 0xFF;
+        if (t->hubLimit > HUB_LIMIT_MAX) t->hubLimit = HUB_LIMIT_MAX;
         SetPushing(t, (p->flags & 1) ? 1 : 0);
         p->index = -1;                    // done
         ++restored;
@@ -841,7 +975,7 @@ static void HookXform(BYTE* v, float* pos, float yaw, float pitch)
 }
 
 // ---------------------------------------------------------------- train window
-static int g_latchTrain, g_latchFreight, g_latchPassenger;
+static int g_latchTrain, g_latchFreight, g_latchPassenger, g_latchUp, g_latchDown, g_latchReset;
 
 // The game's fonts: every global the game passes as the font to a
 // C3D_FONTMANAGER::Print* import (found at start). The indicator uses the one
@@ -967,14 +1101,14 @@ static bool ScreenSize(float* w, float* h)
 // what is drawn while it draws, and the text was cut off or scrolled away.
 // The train window only records what to show; the window dispatcher's hook
 // draws it if a train window was drawn in the same pass.
-static struct { BYTE* lead; int chosen, pushing, turned; unsigned pass; } g_shown;
+static struct { BYTE* lead; int chosen, pushing, turned, limit; unsigned pass; } g_shown;
 static unsigned g_pass;                   // windows drawn so far (dispatcher calls)
 
 // Three lines:
 //   Реверс: ВКЛ (вручную) · толкает   [CTRL+F9]
 //   Все грузовые: вкл   [CTRL+SHIFT+F9]
 //   Все пассажирские: выкл   [CTRL+ALT+F9]
-static void Indicator(BYTE* lead, int chosen, int pushing, int turned)
+static void Indicator(BYTE* lead, int chosen, int pushing, int turned, int limit)
 {
     if (!cfg.indicator || !g_print) return;
     ReloadIndicatorSettings();
@@ -994,10 +1128,13 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned)
                        : chosen            ? L" (вручную)"
                        : classOn           ? (passenger ? L" (все пассажирские)" : L" (все грузовые)")
                        : L"";
-    wchar_t lines[3][200], kT[40], kF[40], kP[40];
-    swprintf(kT, 40, L"%hs", cfg.keyTrain.label);
-    swprintf(kF, 40, L"%hs", cfg.keyFreight.label);
-    swprintf(kP, 40, L"%hs", cfg.keyPassenger.label);
+    wchar_t lines[4][200], kT[40], kF[40], kP[40], kU[40], kD[40], kR[40];
+    KeyText(&cfg.keyLimitUp, kU, 40);
+    KeyText(&cfg.keyLimitDown, kD, 40);
+    KeyText(&cfg.keyLimitReset, kR, 40);
+    KeyText(&cfg.keyTrain, kT, 40);
+    KeyText(&cfg.keyFreight, kF, 40);
+    KeyText(&cfg.keyPassenger, kP, 40);
     // What is on the screen, from how the train is drawn: mirrored puts the
     // locomotive at the back, turned round faces its cab the other way, so
     // the cab faces the way of travel when both or neither apply.
@@ -1010,13 +1147,28 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned)
     swprintf(lines[0], 200, L"Реверс: %ls%ls%ls   [%ls]", chosen || classOn ? L"ВКЛ" : L"выкл", why, motion, kT);
     swprintf(lines[1], 200, L"Все грузовые: %ls   [%ls]", g_allFreight ? L"вкл" : L"выкл", kF);
     swprintf(lines[2], 200, L"Все пассажирские: %ls   [%ls]", g_allPassenger ? L"вкл" : L"выкл", kP);
-    unsigned long colors[3] = { chosen || classOn ? GREEN : GREY, g_allFreight ? GREEN : GREY,
-                                g_allPassenger ? GREEN : GREY };
+    // "(Ctrl -/+, сброс: Ctrl Shift -)"; the two step keys share one prefix
+    // when their modifiers are the same.
+    wchar_t steps[64];
+    if (SameMods(&cfg.keyLimitDown, &cfg.keyLimitUp)) {
+        wchar_t mods[32], dn[16], up[16];
+        bool sym = cfg.keyLimitDown.vk == VK_OEM_MINUS || cfg.keyLimitDown.vk == VK_SUBTRACT;
+        KeyMods(&cfg.keyLimitDown, sym ? L" " : L"+", mods, 32);
+        KeyName(&cfg.keyLimitDown, dn, 16);
+        KeyName(&cfg.keyLimitUp, up, 16);
+        swprintf(steps, 64, L"%ls%ls/%ls", mods, dn, up);
+    } else {
+        swprintf(steps, 64, L"%ls / %ls", kD, kU);
+    }
+    if (limit) swprintf(lines[3], 200, L"Вагонов из хаба: не больше %d   (%ls, сброс: %ls)", limit, steps, kR);
+    else       swprintf(lines[3], 200, L"Вагонов из хаба: без ограничения   (%ls, сброс: %ls)", steps, kR);
+    unsigned long colors[4] = { chosen || classOn ? GREEN : GREY, g_allFreight ? GREEN : GREY,
+                                g_allPassenger ? GREEN : GREY, limit ? GREEN : GREY };
 
     // Place the block by its corner. The font has no width query here, so a
     // right-hand anchor uses an estimate of the longest line (~0.55 em a glyph).
-    float blockH = 3.0f * lineH, blockW = 0.0f;
-    for (int i = 0; i < 3; ++i) {
+    float blockH = 4.0f * lineH, blockW = 0.0f;
+    for (int i = 0; i < 4; ++i) {
         float wl = (float)wcslen(lines[i]) * (g_fontPx > 0.0f ? g_fontPx : 17.0f) * 0.55f;
         if (wl > blockW) blockW = wl;
     }
@@ -1028,7 +1180,7 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned)
     if (x < 0.0f) x = 0.0f;
     if (y < 0.0f) y = 0.0f;
 
-    for (int i = 0; i < 3; ++i) Text(x, y + i * lineH, colors[i], lines[i]);
+    for (int i = 0; i < 4; ++i) Text(x, y + i * lineH, colors[i], lines[i]);
 }
 
 static void TrainWindow(BYTE* ui, BYTE* window, FnPanel orig)
@@ -1049,28 +1201,36 @@ static void TrainWindow(BYTE* ui, BYTE* window, FnPanel orig)
         Logf("railreverse  train window: train %p (%s)", lead, IsPassengerTrain(lead) ? "passenger" : "freight");
     }
 
-    int chosen = 0, pushing = 0, turned = 0;
+    int chosen = 0, pushing = 0, turned = 0, limit = 0;
     if (lead) {
-        // The combinations share F9, so each is matched exactly (modifiers
+        // The combinations share keys, so each is matched exactly (modifiers
         // included): CTRL+SHIFT+F9 never also counts as CTRL+F9.
         bool toggleTrain     = Pressed(&cfg.keyTrain, &g_latchTrain);
         bool toggleFreight   = Pressed(&cfg.keyFreight, &g_latchFreight);
         bool togglePassenger = Pressed(&cfg.keyPassenger, &g_latchPassenger);
+        bool limitUp         = Pressed(&cfg.keyLimitUp, &g_latchUp);
+        bool limitDown       = Pressed(&cfg.keyLimitDown, &g_latchDown);
+        bool limitReset      = Pressed(&cfg.keyLimitReset, &g_latchReset);
         EnterCriticalSection(&g_lock);
         if (toggleFreight)   g_allFreight = !g_allFreight;
         if (togglePassenger) g_allPassenger = !g_allPassenger;
-        Train* t = Current(lead, toggleTrain);
+        Train* t = Current(lead, toggleTrain || limitUp || limitDown || limitReset);
         if (t && toggleTrain) t->chosen = !t->chosen;
-        if (t) { chosen = t->chosen; pushing = t->pushing; turned = t->turned; }
+        if (t && limitUp && t->hubLimit < HUB_LIMIT_MAX) ++t->hubLimit;     // "no limit" -> 1 -> ... -> 10
+        if (t && limitDown && t->hubLimit > 1) --t->hubLimit;               // 10 -> ... -> 1, stops at 1
+        if (t && limitReset) t->hubLimit = 0;                              // "no limit"
+        if (t) { chosen = t->chosen; pushing = t->pushing; turned = t->turned; limit = t->hubLimit; }
         LeaveCriticalSection(&g_lock);
         if (toggleTrain)     Logf("railreverse  train %p: reversing %s", lead, chosen ? "ON" : "off");
         if (toggleFreight)   Logf("railreverse  all freight trains: %s", g_allFreight ? "ON" : "off");
         if (togglePassenger) Logf("railreverse  all passenger trains: %s", g_allPassenger ? "ON" : "off");
+        if (limitUp || limitDown || limitReset) Logf("railreverse  train %p: hub limit %d%s", lead, limit, limit ? " wagons" : " (none)");
     }
 
     orig(ui, window);
     if (lead) {
         g_shown.lead = lead; g_shown.chosen = chosen; g_shown.pushing = pushing; g_shown.turned = turned;
+        g_shown.limit = limit;
         g_shown.pass = g_pass;
     }
 }
@@ -1083,7 +1243,7 @@ static void HookDispatch(BYTE* ui)
 {
     unsigned pass = ++g_pass;
     g_origDispatch(ui);
-    if (g_shown.lead && g_shown.pass == pass) Indicator(g_shown.lead, g_shown.chosen, g_shown.pushing, g_shown.turned);
+    if (g_shown.lead && g_shown.pass == pass) Indicator(g_shown.lead, g_shown.chosen, g_shown.pushing, g_shown.turned, g_shown.limit);
 }
 
 // ---------------------------------------------------------------- plugin
@@ -1224,6 +1384,12 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     if (!ParseKey(s, &cfg.keyFreight)) { Logf("railreverse  key_all_freight \"%s\" not understood, using CTRL+SHIFT+F9", s); ParseKey("CTRL+SHIFT+F9", &cfg.keyFreight); }
     H->configString(RR_INI, "railreverse", "key_all_passenger", s, sizeof(s), "CTRL+ALT+F9");
     if (!ParseKey(s, &cfg.keyPassenger)) { Logf("railreverse  key_all_passenger \"%s\" not understood, using CTRL+ALT+F9", s); ParseKey("CTRL+ALT+F9", &cfg.keyPassenger); }
+    H->configString(RR_INI, "railreverse", "key_hub_limit_up", s, sizeof(s), "CTRL+PLUS");
+    if (!ParseKey(s, &cfg.keyLimitUp)) { Logf("railreverse  key_hub_limit_up \"%s\" not understood, using CTRL+PLUS", s); ParseKey("CTRL+PLUS", &cfg.keyLimitUp); }
+    H->configString(RR_INI, "railreverse", "key_hub_limit_down", s, sizeof(s), "CTRL+MINUS");
+    if (!ParseKey(s, &cfg.keyLimitDown)) { Logf("railreverse  key_hub_limit_down \"%s\" not understood, using CTRL+MINUS", s); ParseKey("CTRL+MINUS", &cfg.keyLimitDown); }
+    H->configString(RR_INI, "railreverse", "key_hub_limit_reset", s, sizeof(s), "CTRL+SHIFT+MINUS");
+    if (!ParseKey(s, &cfg.keyLimitReset)) { Logf("railreverse  key_hub_limit_reset \"%s\" not understood, using CTRL+SHIFT+MINUS", s); ParseKey("CTRL+SHIFT+MINUS", &cfg.keyLimitReset); }
     Logf("railreverse  v%s init: all freight %d, all passenger %d, push speed %.0f km/h, keys %s / %s / %s",
          RR_VERSION, cfg.allFreightDefault, cfg.allPassengerDefault, cfg.pushKmh,
          cfg.keyTrain.label, cfg.keyFreight.label, cfg.keyPassenger.label);
@@ -1326,6 +1492,37 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
                !Hook(SIG(SIG_DISPATCH), DISPATCH_STOLEN, (void*)HookDispatch, (void**)&g_origDispatch, "window dispatcher")) {
         g_print = 0;
         Logf("railreverse  window dispatcher not found - no indicator");
+    }
+
+    // Distribution offices: the hub limit (two call sites).
+    {
+        BYTE* a = FindUnique(SIG(SIG_ROOM_A));
+        BYTE* b = FindUnique(SIG(SIG_ROOM_B));
+        BYTE* ta = a ? a + ROOM_CALL_AT + 5 + *(INT32*)(a + ROOM_CALL_AT + 1) : 0;
+        BYTE* tb = b ? b + ROOM_CALL_AT + 5 + *(INT32*)(b + ROOM_CALL_AT + 1) : 0;
+        BYTE* stub = (a && b && ta == tb) ? AllocNear(a, 32) : 0;
+        if (stub) {
+            // two of: jmp [rip+0]; dq <thunk> - within reach of the call sites
+            void* thunks[2] = { (void*)RR_RoomThunkA, (void*)RR_RoomThunkB };
+            for (int i = 0; i < 2; ++i) {
+                BYTE* s = stub + 16 * i;
+                s[0] = 0xFF; s[1] = 0x25; *(INT32*)(s + 2) = 0;
+                *(void**)(s + 6) = thunks[i];
+            }
+            g_room = (FnRoom)ta;
+            BYTE* sites[2] = { a + ROOM_CALL_AT, b + ROOM_CALL_AT };
+            for (int i = 0; i < 2; ++i) {
+                DWORD old;
+                VirtualProtect(sites[i], 5, PAGE_EXECUTE_READWRITE, &old);
+                *(INT32*)(sites[i] + 1) = (INT32)(stub + 16 * i - (sites[i] + 5));
+                VirtualProtect(sites[i], 5, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), sites[i], 5);
+            }
+            Logf("railreverse  hub limit: office room checks at +%06llX / +%06llX redirected",
+                 (unsigned long long)(sites[0] - g_exeBase), (unsigned long long)(sites[1] - g_exeBase));
+        } else {
+            Logf("railreverse  hub limit unavailable: office room check not found");
+        }
     }
 
     if (BYTE* at = FindUnique(SIG(SIG_VEHVEC)))

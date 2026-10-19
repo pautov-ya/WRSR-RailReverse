@@ -21,9 +21,20 @@ With a train window open (any car of the train):
 | `Ctrl+Shift+F9` | reversing for every freight train on/off |
 | `Ctrl+Alt+F9` | reversing for every passenger train on/off |
 
+| `Ctrl -` / `Ctrl +` | most wagons a distribution office (hub) hands this locomotive: 1 … 10 |
+| `Ctrl Shift -` | no hub limit |
+
 A train pushes if it was turned on itself or its class is. Turned off while pushing, it finishes the
 trip and pulls from the next reversal on. The state is drawn above the train window and kept in
 `railreverse.txt` beside the save. A pushing train entering a depot pulls again.
+
+### Hub limit
+
+The game fills a train at a distribution office up to the length of the office's track; there is
+no wagon count. With a limit set, the office's "room for one more group" check (two call sites in
+`FUN_14068b330`) answers "no room" once the wagons on the train plus the group it is about to
+couple would go over the limit. A train with no wagons always gets its first group, so it never
+leaves empty; groups are coupled whole.
 
 ## Build
 
