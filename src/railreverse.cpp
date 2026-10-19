@@ -18,7 +18,7 @@
 #include <math.h>
 #include <wchar.h>
 
-#define RR_VERSION "0.3.1"
+#define RR_VERSION "0.3.2"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -1230,8 +1230,73 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     return 0;
 }
 
+// ---------------------------------------------------------------- crash log
+// A diagnostic only: on an access violation anywhere in the game, log which
+// module and offset it happened at, and the module addresses found on the
+// stack (return addresses: who called whom). Nothing is handled or changed;
+// the exception goes on exactly as without it. This is first-chance, so an
+// exception the game catches itself is logged too - the line says so.
+static volatile LONG g_crashLines;
+
+static bool ModuleOf(void* a, char* out, size_t cap, ULONG_PTR* off)
+{
+    HMODULE m = 0;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)a, &m) || !m) return false;
+    char path[MAX_PATH];
+    DWORD n = GetModuleFileNameA(m, path, sizeof(path));
+    const char* base = path;
+    for (DWORD i = 0; i < n; ++i) if (path[i] == '\\' || path[i] == '/') base = path + i + 1;
+    _snprintf_s(out, cap, _TRUNCATE, "%s", n ? base : "?");
+    *off = (ULONG_PTR)a - (ULONG_PTR)m;
+    return true;
+}
+
+static LONG CALLBACK CrashLog(PEXCEPTION_POINTERS ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_PRIV_INSTRUCTION) return EXCEPTION_CONTINUE_SEARCH;
+    // Each faulting address is logged once, up to 64 of them: an exception the
+    // game handles and repeats does not use up the lines a real crash needs.
+    static void* seen[64];
+    void* at = ep->ExceptionRecord->ExceptionAddress;
+    for (int i = 0; i < 64; ++i) if (seen[i] == at) return EXCEPTION_CONTINUE_SEARCH;
+    LONG slot = InterlockedIncrement(&g_crashLines) - 1;
+    if (slot >= 64) return EXCEPTION_CONTINUE_SEARCH;
+    seen[slot] = at;
+
+    char mod[64]; ULONG_PTR off = 0;
+    if (!ModuleOf(at, mod, sizeof(mod), &off)) { strcpy(mod, "?"); off = (ULONG_PTR)at; }
+    const char* how = "?";
+    ULONG_PTR target = 0;
+    if (code == EXCEPTION_ACCESS_VIOLATION && ep->ExceptionRecord->NumberParameters >= 2) {
+        ULONG_PTR kind = ep->ExceptionRecord->ExceptionInformation[0];
+        how = kind == 0 ? "read" : kind == 1 ? "write" : kind == 8 ? "execute" : "?";
+        target = ep->ExceptionRecord->ExceptionInformation[1];
+    }
+    char stack[512] = "";
+    int len = 0, found = 0;
+    ULONG_PTR* sp = (ULONG_PTR*)ep->ContextRecord->Rsp;
+    for (int i = 0; i < 256 && found < 8; ++i) {
+        ULONG_PTR q = sp[i];
+        if (q < 0x10000) continue;
+        char m2[64]; ULONG_PTR o2;
+        if (ModuleOf((void*)q, m2, sizeof(m2), &o2) && o2 > 0x1000) {
+            len += _snprintf_s(stack + len, sizeof(stack) - len, _TRUNCATE, " %s+%llX", m2, (unsigned long long)o2);
+            ++found;
+        }
+    }
+    Logf("railreverse  CRASH LOG (first chance, may still be handled by the game): 0x%08lX at %s+%llX, %s of %p; "
+         "stack:%s", code, mod, (unsigned long long)off, how, (void*)target, stack);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 extern "C" __declspec(dllexport) int TsmPluginStart(void)
 {
+    if (H->configInt(RR_INI, "railreverse", "crash_log", 1) && AddVectoredExceptionHandler(1, CrashLog))
+        Logf("railreverse  crash log armed");
+
     // The core (flip + placement) is resolved before anything is hooked: a
     // missing piece leaves the game untouched instead of half-patched.
     g_sample = (FnSample)FindUnique(SIG(SIG_SAMPLE));
