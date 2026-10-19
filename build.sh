@@ -10,7 +10,7 @@ GAME=D:/SteamLibrary/steamapps/common/SovietRepublic
 PROJECT="$GAME/media_soviet/workshop_wip/9784150"
 
 mkdir -p build
-"$CXX" -O2 -Wall -Wno-unused-function -static -shared -o build/railreverse.dll src/railreverse.cpp
+"$CXX" -O2 -Wall -Wno-unused-function -static -shared -o build/railreverse.dll src/railreverse.cpp -luser32
 cp -f src/railreverse.ini build/railreverse.ini
 echo "[build] build/railreverse.dll"
 
