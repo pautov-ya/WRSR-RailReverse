@@ -18,7 +18,7 @@
 #include <math.h>
 #include <wchar.h>
 
-#define RR_VERSION "0.3.0"
+#define RR_VERSION "0.3.1"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -998,9 +998,16 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned)
     swprintf(kT, 40, L"%hs", cfg.keyTrain.label);
     swprintf(kF, 40, L"%hs", cfg.keyFreight.label);
     swprintf(kP, 40, L"%hs", cfg.keyPassenger.label);
-    swprintf(lines[0], 200, L"Реверс: %ls%ls%ls   [%ls]", chosen || classOn ? L"ВКЛ" : L"выкл", why,
-             pushing ? (light ? L" · задним ходом" : L" · толкает") : L"", kT);
-    if (turned) wcscat(lines[0], L"   · кабиной к вагонам");
+    // What is on the screen, from how the train is drawn: mirrored puts the
+    // locomotive at the back, turned round faces its cab the other way, so
+    // the cab faces the way of travel when both or neither apply.
+    bool cabForward = (pushing != 0) == (turned != 0);
+    const wchar_t* motion =
+        light ? (cabForward ? L"" : L" · задним ходом")
+              : (!pushing && !turned) ? L""
+              : pushing ? (cabForward ? L" · толкает, кабиной вперёд" : L" · толкает, кабиной назад")
+              : L" · тянет, кабиной назад";
+    swprintf(lines[0], 200, L"Реверс: %ls%ls%ls   [%ls]", chosen || classOn ? L"ВКЛ" : L"выкл", why, motion, kT);
     swprintf(lines[1], 200, L"Все грузовые: %ls   [%ls]", g_allFreight ? L"вкл" : L"выкл", kF);
     swprintf(lines[2], 200, L"Все пассажирские: %ls   [%ls]", g_allPassenger ? L"вкл" : L"выкл", kP);
     unsigned long colors[3] = { chosen || classOn ? GREEN : GREY, g_allFreight ? GREEN : GREY,

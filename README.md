@@ -46,6 +46,19 @@ Paths to the compiler and the game are at the top of `build.sh`.
   the two core hook sites.
 - [docs/findings-0.3.md](docs/findings-0.3.md): saves, the train window, text drawing, depots.
 
+## Known limitations
+
+- For the game a pushing train still runs locomotive first: its logical head is where the first
+  wagon is drawn. When a distribution office takes **all** the wagons of a pushing train, the
+  locomotive appears where that first wagon stood and leaves from there. A standing train is not
+  redrawn, so the plugin only learns of it at the office's reversal of the empty locomotive. A fix
+  needs the office's wagon-removal code; an attempt is on branch `experiment/normalize-at-stops`.
+- A train with a locomotive at both ends never pushes (`skip_loco_both_ends`), although its window
+  may show reversing as on.
+- The game always draws a locomotive with its back to its wagons. Where wagons are coupled at the
+  cab end, the plugin draws the locomotive turned round (its "coupled back to front" flag, for the
+  drawing only).
+
 ## Licence
 
 GPL-3.0, like TesmioLoader, whose plugin headers are in `include/`.
