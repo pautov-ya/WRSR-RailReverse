@@ -1,75 +1,92 @@
-# railreverse
+[English](README.md) | [Русский](README_RU.md)
 
-A plugin for **Workers & Resources: Soviet Republic** 1.1.1.9. When a train reverses, the locomotive
-stays where it is and pushes its wagons back, instead of jumping to the other end of the train.
+# Rail Reverse
 
-Game logic is untouched: after the game's own reversal the train is marked as pushing and every car
-is drawn on the mirror image of its place on the same stretch of track. Mass, power and grades work
-exactly as when the train pulls. While pushing, the train is limited to `push_speed_kmh`
-(25 km/h, the Soviet/Russian shunting limit for moving wagons first).
+**[Steam Workshop](https://steamcommunity.com/sharedfiles/filedetails/?id=3823129138)**
 
-Loaded through [Republic Mod Loader](https://steamcommunity.com/sharedfiles/filedetails/?id=3787969749)
-(Tesmio API 4).
+A plugin for **Workers & Resources: Soviet Republic** that makes trains work more like a real railway.
 
-## In game
+### Reversing
 
-With a train window open (any car of the train):
+In the base game, a reversing train's locomotive instantly jumps to the other end. With Rail Reverse
+it stays put and **pushes the wagons back**, as in real shunting:
 
-| Key | |
+- pushing speed is capped at 25 km/h (the Soviet shunting limit);
+- a locomotive without wagons runs backwards instead of turning round;
+- reversing is switched on per train, for all freight trains, or for all passenger trains;
+- trains with a locomotive at each end work as in the base game.
+
+### Hub wagon limit
+
+In the base game, a distribution office (hub) fills a train with wagons up to the length of its track.
+Rail Reverse lets you give each locomotive its own limit: 1 to 10 wagons.
+
+All settings are kept in a file next to the save; the save itself is not changed.
+
+## Requirements
+
+- Workers & Resources: Soviet Republic **1.1.1.9**, 64-bit.
+- [Republic Mod Loader](https://steamcommunity.com/sharedfiles/filedetails/?id=3787969749) (RML).
+- No DLC. Compatible with [RailPhysics](https://steamcommunity.com/sharedfiles/filedetails/?id=3776784867).
+
+## Installation
+
+1. Subscribe to [Republic Mod Loader](https://steamcommunity.com/sharedfiles/filedetails/?id=3787969749)
+   and [Rail Reverse](https://steamcommunity.com/sharedfiles/filedetails/?id=3823129138) on the Steam Workshop.
+2. Start RML and enable **railreverse** under **Plugins**.
+3. Start the game from RML.
+
+To uninstall, unsubscribe from the mod.
+
+## Controls
+
+With a train window open:
+
+| Keys | Action |
 |---|---|
-| `Ctrl+F9` | reversing on/off for this train |
-| `Ctrl+Shift+F9` | reversing for every freight train on/off |
-| `Ctrl+Alt+F9` | reversing for every passenger train on/off |
+| `Ctrl+F9` | reverse for this train |
+| `Ctrl+Shift+F9` | reverse for all freight trains |
+| `Ctrl+Alt+F9` | reverse for all passenger trains |
+| `Ctrl -` / `Ctrl +` | hub wagon limit −1 / +1 |
+| `Ctrl Shift -` | no hub wagon limit |
 
-| `Ctrl -` / `Ctrl +` | most wagons a distribution office (hub) hands this locomotive: 1 … 10 |
-| `Ctrl Shift -` | no hub limit |
-
-A train pushes if it was turned on itself or its class is. Turned off while pushing, it finishes the
-trip and pulls from the next reversal on. The state is drawn above the train window and kept in
-`railreverse.txt` beside the save. A pushing train entering a depot pulls again.
-
-### Hub limit
-
-The game fills a train at a distribution office up to the length of the office's track; there is
-no wagon count. With a limit set, the office's "room for one more group" check (two call sites in
-`FUN_14068b330`) answers "no room" once the wagons on the train plus the group it is about to
-couple would go over the limit. A train with no wagons always gets its first group, so it never
-leaves empty; groups are coupled whole.
-
-## Build
-
-```sh
-./build.sh            # build with llvm-mingw and deploy to media_soviet/workshop_wip/9784150
-./build.sh nodeploy   # build only
-```
-
-Paths to the compiler and the game are at the top of `build.sh`.
+A corner of the screen shows the train's state, in Russian if the game is in Russian and in
+English otherwise.
 
 ## Settings
 
-`src/railreverse.ini`, deployed beside the DLL: the keys, the starting `all_freight` /
-`all_passenger` switches, `push_speed_kmh`, `skip_loco_both_ends`, the indicator position and
-`log_flips`. Each key is documented there.
+Keys, speeds, the indicator's language, position and size are set in `railreverse.ini`; each
+option is described there. The file is in
+`<SteamLibrary>\steamapps\workshop\content\784150\3823129138\plugins\`. A Steam update of the mod
+overwrites it, so redo your changes after an update.
 
 ## How it works
 
-- [docs/findings-1a.md](docs/findings-1a.md): the reversal function, the wagon placement formula and
-  the two core hook sites.
-- [docs/findings-0.3.md](docs/findings-0.3.md): saves, the train window, text drawing, depots.
+The game still reverses the train as usual; only the drawing changes. Each car of a pushing train is
+drawn at the mirror position on the same stretch of track, so the locomotive stays where it was.
+Physics, signals and routes are untouched. Game code is found by byte signatures; if an update breaks
+one, that feature turns off and the RML log says so. Details are in [docs/](docs/).
 
 ## Known limitations
 
-- For the game a pushing train still runs locomotive first: its logical head is where the first
-  wagon is drawn. When a distribution office takes **all** the wagons of a pushing train, the
-  locomotive appears where that first wagon stood and leaves from there. A standing train is not
-  redrawn, so the plugin only learns of it at the office's reversal of the empty locomotive. A fix
-  needs the office's wagon-removal code; an attempt is on branch `experiment/normalize-at-stops`.
-- A train with a locomotive at both ends never pushes (`skip_loco_both_ends`), although its window
-  may show reversing as on.
-- The game always draws a locomotive with its back to its wagons. Where wagons are coupled at the
-  cab end, the plugin draws the locomotive turned round (its "coupled back to front" flag, for the
-  drawing only).
+- When a hub takes **all** the wagons of a pushing train, the locomotive jumps to where the first
+  wagon was.
 
-## Licence
+## Building
 
-GPL-3.0, like TesmioLoader, whose plugin headers are in `include/`.
+```sh
+./build.sh            # build and deploy to the game
+./build.sh nodeploy   # build only
+```
+
+Requires [llvm-mingw](https://github.com/mstorsjo/llvm-mingw); paths are set in `build.sh`.
+
+## Credits
+
+- [TesmioLoader](https://github.com/MaxLegend/TesmioLoader) by MaxLegend: plugin API headers.
+- [Republic Mod Loader](https://github.com/Ultimate-Universe/WRSR-RepublicModLoader) by Ultimate-Universe.
+- [RailPhysics](https://github.com/TheRealMeowMeow00/WRSR_RailPhysics): research on the game's rail code.
+
+## License
+
+[GPL-3.0](LICENSE).

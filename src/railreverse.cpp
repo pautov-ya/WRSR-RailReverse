@@ -17,8 +17,9 @@
 #include "../include/tesmio_plugin.h"
 #include <math.h>
 #include <wchar.h>
+#include <shlwapi.h>
 
-#define RR_VERSION "0.4.0"
+#define RR_VERSION "0.4.1"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -1029,6 +1030,64 @@ static void Text(float x, float y, unsigned long color, const wchar_t* s)
     g_print(g_fontManager, g_font, x, y, color, s);
 }
 
+// ---------------------------------------------------------------- language
+// The indicator speaks Russian when the game does, English otherwise.
+struct Ui {
+    const wchar_t *whyBoth, *whyManual, *whyPassenger, *whyFreight;
+    const wchar_t *backward, *pushCabFwd, *pushCabBack, *pullCabBack;
+    const wchar_t *reverse, *ON, *OFF, *allFreight, *allPassenger, *on, *off;
+    const wchar_t *hubLimit, *hubNoLimit;
+};
+static const Ui kRussian = {
+    L" (вручную, и включены все)", L" (вручную)", L" (все пассажирские)", L" (все грузовые)",
+    L" · задним ходом", L" · толкает, кабиной вперёд", L" · толкает, кабиной назад", L" · тянет, кабиной назад",
+    L"Реверс: %ls%ls%ls   [%ls]", L"ВКЛ", L"выкл",
+    L"Все грузовые: %ls   [%ls]", L"Все пассажирские: %ls   [%ls]", L"вкл", L"выкл",
+    L"Вагонов из хаба: не больше %d   (%ls, сброс: %ls)", L"Вагонов из хаба: без ограничения   (%ls, сброс: %ls)",
+};
+static const Ui kEnglish = {
+    L" (this train, and all of its class)", L" (this train)", L" (all passenger trains)", L" (all freight trains)",
+    L" · running backwards", L" · pushing, cab first", L" · pushing, cab last", L" · pulling, cab last",
+    L"Reverse: %ls%ls%ls   [%ls]", L"ON", L"off",
+    L"All freight trains: %ls   [%ls]", L"All passenger trains: %ls   [%ls]", L"on", L"off",
+    L"Wagons from a hub: at most %d   (%ls, reset: %ls)", L"Wagons from a hub: no limit   (%ls, reset: %ls)",
+};
+static const Ui* T = &kRussian;
+
+// railreverse.ini `language`: ru, en, or auto - the game's own choice, read
+// from media_soviet/config.ini ($TEXT LANGUAGE2 sovietRussian.btf, or "auto",
+// which the game resolves to the Windows language).
+static void PickLanguage(void)
+{
+    char want[16];
+    H->configString(RR_INI, "railreverse", "language", want, sizeof(want), "auto");
+    bool ru;
+    const char* why;
+    if (!_stricmp(want, "ru"))      { ru = true;  why = "ini"; }
+    else if (!_stricmp(want, "en")) { ru = false; why = "ini"; }
+    else {
+        char path[MAX_PATH], line[256], value[128] = "";
+        DWORD n = GetModuleFileNameA(g_exe, path, MAX_PATH);
+        while (n && path[n - 1] != '\\' && path[n - 1] != '/') --n;
+        path[n] = 0;
+        strncat(path, "media_soviet\\config.ini", MAX_PATH - n - 1);
+        if (FILE* f = fopen(path, "r")) {
+            while (fgets(line, sizeof(line), f))
+                if (sscanf(line, " $TEXT LANGUAGE2 %127s", value) == 1) break;
+            fclose(f);
+        }
+        if (value[0] && _stricmp(value, "auto") != 0) {
+            ru = StrStrIA(value, "Russian") != 0;
+            why = value;
+        } else {
+            ru = PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_RUSSIAN;
+            why = "Windows";
+        }
+    }
+    T = ru ? &kRussian : &kEnglish;
+    Logf("railreverse  indicator language: %s (%s)", ru ? "Russian" : "English", why);
+}
+
 #define GREEN 0xFF9BE59Bu
 #define GREY  0xFFD8D8D8u
 
@@ -1124,9 +1183,9 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned, int limit
     bool light = Wagons(lead, &w) == 0;
     bool passenger = IsPassengerTrain(lead);
     bool classOn = passenger ? g_allPassenger != 0 : g_allFreight != 0;
-    const wchar_t* why = chosen && classOn ? L" (вручную, и включены все)"
-                       : chosen            ? L" (вручную)"
-                       : classOn           ? (passenger ? L" (все пассажирские)" : L" (все грузовые)")
+    const wchar_t* why = chosen && classOn ? T->whyBoth
+                       : chosen            ? T->whyManual
+                       : classOn           ? (passenger ? T->whyPassenger : T->whyFreight)
                        : L"";
     wchar_t lines[4][200], kT[40], kF[40], kP[40], kU[40], kD[40], kR[40];
     KeyText(&cfg.keyLimitUp, kU, 40);
@@ -1140,13 +1199,13 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned, int limit
     // the cab faces the way of travel when both or neither apply.
     bool cabForward = (pushing != 0) == (turned != 0);
     const wchar_t* motion =
-        light ? (cabForward ? L"" : L" · задним ходом")
+        light ? (cabForward ? L"" : T->backward)
               : (!pushing && !turned) ? L""
-              : pushing ? (cabForward ? L" · толкает, кабиной вперёд" : L" · толкает, кабиной назад")
-              : L" · тянет, кабиной назад";
-    swprintf(lines[0], 200, L"Реверс: %ls%ls%ls   [%ls]", chosen || classOn ? L"ВКЛ" : L"выкл", why, motion, kT);
-    swprintf(lines[1], 200, L"Все грузовые: %ls   [%ls]", g_allFreight ? L"вкл" : L"выкл", kF);
-    swprintf(lines[2], 200, L"Все пассажирские: %ls   [%ls]", g_allPassenger ? L"вкл" : L"выкл", kP);
+              : pushing ? (cabForward ? T->pushCabFwd : T->pushCabBack)
+              : T->pullCabBack;
+    swprintf(lines[0], 200, T->reverse, chosen || classOn ? T->ON : T->OFF, why, motion, kT);
+    swprintf(lines[1], 200, T->allFreight, g_allFreight ? T->on : T->off, kF);
+    swprintf(lines[2], 200, T->allPassenger, g_allPassenger ? T->on : T->off, kP);
     // "(Ctrl -/+, сброс: Ctrl Shift -)"; the two step keys share one prefix
     // when their modifiers are the same.
     wchar_t steps[64];
@@ -1160,8 +1219,8 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned, int limit
     } else {
         swprintf(steps, 64, L"%ls / %ls", kD, kU);
     }
-    if (limit) swprintf(lines[3], 200, L"Вагонов из хаба: не больше %d   (%ls, сброс: %ls)", limit, steps, kR);
-    else       swprintf(lines[3], 200, L"Вагонов из хаба: без ограничения   (%ls, сброс: %ls)", steps, kR);
+    if (limit) swprintf(lines[3], 200, T->hubLimit, limit, steps, kR);
+    else       swprintf(lines[3], 200, T->hubNoLimit, steps, kR);
     unsigned long colors[4] = { chosen || classOn ? GREEN : GREY, g_allFreight ? GREEN : GREY,
                                 g_allPassenger ? GREEN : GREY, limit ? GREEN : GREY };
 
@@ -1377,6 +1436,7 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     cfg.indicatorX   = ConfigFloat("indicator_x", 0.6f);
     cfg.indicatorY   = ConfigFloat("indicator_y", 0.0f);
     cfg.fontScale    = H->configInt(RR_INI, "railreverse", "indicator_font_scale", 140);
+    PickLanguage();
     cfg.outline      = H->configInt(RR_INI, "railreverse", "indicator_outline", 1);
     H->configString(RR_INI, "railreverse", "key_train", s, sizeof(s), "CTRL+F9");
     if (!ParseKey(s, &cfg.keyTrain)) { Logf("railreverse  key_train \"%s\" not understood, using CTRL+F9", s); ParseKey("CTRL+F9", &cfg.keyTrain); }
