@@ -19,7 +19,7 @@ it stays put and **pushes the wagons back**, as in real shunting:
 ### Hub wagon limit
 
 In the base game, a distribution office (hub) fills a train with wagons up to the length of its track.
-Rail Reverse lets you give each locomotive its own limit: 1 to 10 wagons.
+Rail Reverse lets you give each locomotive its own limit: 1 to 25 wagons (the maximum is `hub_limit_max` in `railreverse.ini`).
 
 All settings are kept in a file next to the save; the save itself is not changed.
 

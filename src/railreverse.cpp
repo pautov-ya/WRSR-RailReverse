@@ -19,7 +19,7 @@
 #include <wchar.h>
 #include <shlwapi.h>
 
-#define RR_VERSION "0.4.1"
+#define RR_VERSION "0.4.3"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -117,7 +117,10 @@ static const short SIG_ROOM_B[] = {
 };
 #define ROOM_CALL_AT 7            // the e8 in both
 
-#define HUB_LIMIT_MAX  10
+// The highest hub limit the keys reach: ini hub_limit_max, 1 ... 255 (it is
+// kept in 8 bits of a train's flags in railreverse.txt).
+#define HUB_LIMIT_DEFAULT_MAX 25
+#define HUB_LIMIT_CEILING     255
 
 // The game's list of every vehicle, in save order: vehicles.bin is written by
 // walking it and read back into it in the same order.
@@ -163,6 +166,7 @@ static struct {
     float pushKmh;          // speed cap while pushing, 0 = none
     float lightKmh;         // speed cap for a locomotive running backwards on its own, 0 = none
     int   skipBothEnds;     // a locomotive at the far end too: leave the train alone
+    int   hubLimitMax;      // the highest hub limit
     int   logFlips;
     int   indicator;        // draw the state above the train window
     int   anchor;           // screen corner: ANCHOR_*
@@ -740,7 +744,7 @@ static void RestorePending(void)
         t->chosen = (p->flags & 2) ? 1 : 0;
         t->turned = (p->flags & 4) ? 1 : 0;
         t->hubLimit = (p->flags >> 8) & 0xFF;
-        if (t->hubLimit > HUB_LIMIT_MAX) t->hubLimit = HUB_LIMIT_MAX;
+        if (t->hubLimit > cfg.hubLimitMax) t->hubLimit = cfg.hubLimitMax;
         SetPushing(t, (p->flags & 1) ? 1 : 0);
         p->index = -1;                    // done
         ++restored;
@@ -1275,7 +1279,7 @@ static void TrainWindow(BYTE* ui, BYTE* window, FnPanel orig)
         if (togglePassenger) g_allPassenger = !g_allPassenger;
         Train* t = Current(lead, toggleTrain || limitUp || limitDown || limitReset);
         if (t && toggleTrain) t->chosen = !t->chosen;
-        if (t && limitUp && t->hubLimit < HUB_LIMIT_MAX) ++t->hubLimit;     // "no limit" -> 1 -> ... -> 10
+        if (t && limitUp && t->hubLimit < cfg.hubLimitMax) ++t->hubLimit;   // "no limit" -> 1 -> ... -> hub_limit_max
         if (t && limitDown && t->hubLimit > 1) --t->hubLimit;               // 10 -> ... -> 1, stops at 1
         if (t && limitReset) t->hubLimit = 0;                              // "no limit"
         if (t) { chosen = t->chosen; pushing = t->pushing; turned = t->turned; limit = t->hubLimit; }
@@ -1430,6 +1434,9 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     cfg.pushKmh      = (float)H->configInt(RR_INI, "railreverse", "push_speed_kmh", 25);
     cfg.lightKmh     = (float)H->configInt(RR_INI, "railreverse", "light_engine_speed_kmh", 0);
     cfg.skipBothEnds = H->configInt(RR_INI, "railreverse", "skip_loco_both_ends", 1);
+    cfg.hubLimitMax  = H->configInt(RR_INI, "railreverse", "hub_limit_max", HUB_LIMIT_DEFAULT_MAX);
+    if (cfg.hubLimitMax < 1) cfg.hubLimitMax = 1;
+    if (cfg.hubLimitMax > HUB_LIMIT_CEILING) cfg.hubLimitMax = HUB_LIMIT_CEILING;
     cfg.logFlips     = H->configInt(RR_INI, "railreverse", "log_flips", 1);
     cfg.indicator    = H->configInt(RR_INI, "railreverse", "indicator", 1);
     cfg.anchor       = ConfigAnchor(ANCHOR_BOTTOM_LEFT);
