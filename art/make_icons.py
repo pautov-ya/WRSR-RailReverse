@@ -1,11 +1,12 @@
-"""Train window button icons, in the game's button frame: a locomotive pushing
-its wagons (reversing), a wagon under a number the plugin writes (wagons from
-a supply base); and the two Scripts menu buttons (all freight / all passenger
-trains), 512 px.
+"""Button icons, in the game's button frame. Train window: a locomotive
+pushing its wagons (reversing), a wagon under a number the plugin writes
+(wagons from a supply base). Route window: two wagons pulled apart
+(uncouple), a wagon under a U-turn arrow (stop and turn round). And the two
+Scripts menu buttons (all freight / all passenger trains), 512 px.
 
     python make_icons.py <game button_depo.png> <out dir>
-Writes button_push_off/on.png and button_limit_off/on.png (off a dark symbol,
-on a green one), RR_AllFreight.png and RR_AllPassenger.png.
+Writes button_push/limit/uncouple/reverse_off/on.png (off a dark symbol, on a
+green one), RR_AllFreight.png and RR_AllPassenger.png.
 """
 import sys
 
@@ -25,6 +26,39 @@ def frame(path):
             r = min(1.0, max(abs(x - 48), abs(y - 48)) / 33) ** 2
             px[x, y] = tuple(int(mid[i] * (1 - r) + edge[i] * r) for i in range(3)) + (255,)
     return im
+
+
+def uncouple(color):
+    big = Image.new("RGBA", (SIZE * K, SIZE * K), (0, 0, 0, 0))
+    d = ImageDraw.Draw(big)
+    s = K
+    # two wagons, a gap between them, wheels below
+    for x0 in (20, 52):
+        d.rounded_rectangle([x0 * s, 34 * s, (x0 + 24) * s, 54 * s], radius=2 * s, fill=color)
+        for wx in (x0 + 6, x0 + 18):
+            d.ellipse([(wx - 3.5) * s, 54 * s, (wx + 3.5) * s, 61 * s], fill=color)
+    # couplers pulled apart, and arrows pointing away from the gap
+    d.rectangle([44 * s, 42 * s, 47 * s, 46 * s], fill=color)
+    d.rectangle([49 * s, 42 * s, 52 * s, 46 * s], fill=color)
+    for tip, back in ((18, 28), (78, 68)):
+        d.polygon([(tip * s, 25 * s), (back * s, 20 * s), (back * s, 30 * s)], fill=color)
+        d.rectangle([min(back, back + (10 if tip < back else -10)) * s, 23.5 * s,
+                     max(back, back + (10 if tip < back else -10)) * s, 26.5 * s], fill=color)
+    return big.resize((SIZE, SIZE), Image.LANCZOS)
+
+
+def reverse(color):
+    big = Image.new("RGBA", (SIZE * K, SIZE * K), (0, 0, 0, 0))
+    d = ImageDraw.Draw(big)
+    s = K
+    # a wagon on the track, a U-turn arrow over it
+    d.rounded_rectangle([34 * s, 50 * s, 62 * s, 66 * s], radius=2 * s, fill=color)
+    for wx in (40, 56):
+        d.ellipse([(wx - 3.5) * s, 66 * s, (wx + 3.5) * s, 73 * s], fill=color)
+    d.arc([26 * s, 18 * s, 70 * s, 54 * s], start=180, end=360, fill=color, width=6 * s)
+    d.rectangle([26 * s, 36 * s, 32 * s, 42 * s], fill=color)
+    d.polygon([(64 * s, 34 * s), (76 * s, 34 * s), (70 * s, 46 * s)], fill=color)
+    return big.resize((SIZE, SIZE), Image.LANCZOS)
 
 
 def push(color):
@@ -90,7 +124,7 @@ def menu_icon(base, passenger):
 def main():
     base = frame(sys.argv[1])
     out = sys.argv[2].rstrip("/\\")
-    for kind, symbol in (("push", push), ("limit", limit)):
+    for kind, symbol in (("uncouple", uncouple), ("reverse", reverse), ("push", push), ("limit", limit)):
         for name, color in (("off", (60, 57, 48, 255)), ("on", (40, 150, 40, 255))):
             im = base.copy()
             im.alpha_composite(symbol(color))

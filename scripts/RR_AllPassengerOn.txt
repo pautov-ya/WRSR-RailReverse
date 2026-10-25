@@ -1,4 +1,4 @@
-// Rail Reverse - flag: while this script runs, all passenger trains reverse.
+// Rail Operations - flag: while this script runs, all passenger trains reverse.
 // It does nothing else.
 
 include("SOVIETInstructions.txt");

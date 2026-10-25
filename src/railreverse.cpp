@@ -19,7 +19,7 @@
 #include <wchar.h>
 #include <shlwapi.h>
 
-#define RR_VERSION "0.5.0"
+#define RR_VERSION "0.6.0"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -50,6 +50,7 @@
 #define W_KIND         0x248      // int: 0 building, 1 vehicle, ...
 #define WINDOW_VEHICLE 1
 #define RVA_UI_SCALE   0x992088   // float, 1.1.1.9 (DockDistributionOffice, ForceNodes)
+#define RVA_WORLD      0x9D4F10   // DAT_1409d4f10, what the game passes as the world
 
 // ---------------------------------------------------------------- signatures
 // The flip: mov r11,rsp; push rbp; push rbx; lea rbp,[r11-0x458]; sub rsp,0x548 (19 B stolen) ...
@@ -166,6 +167,8 @@ static struct {
     int   skipBothEnds;     // a locomotive at the far end too: leave the train alone
     int   hubLimitMax;      // the highest hub limit
     int   logFlips;
+    int   shunting;         // run round: uncouple / stop-and-turn marks in the route window (ini shunting)
+    int   research;         // research lines in the log, every second per train (ini research_log)
     int   indicator;        // draw the state above the train window
     int   anchor;           // screen corner: ANCHOR_*
     float indicatorX, indicatorY;   // offset from that corner, % of the screen width / height
@@ -179,6 +182,8 @@ static struct {
 // A train pushes after a reversal if it was chosen in its window, or if every
 // train of its class (freight / passenger) is switched on.
 static volatile LONG g_allFreight, g_allPassenger;   // from the Scripts menu flags (ScriptFlags)
+#define BUILD_1119 0x6A3EB6ADu          // SOVIET64.exe 1.1.1.9: its PE time stamp
+static bool g_build119;                 // the fixed addresses below are this build's
 static int g_allForced;                 // no train window to switch anything in: every train reverses
 static volatile LONG g_iconsStale;      // a save was loaded: the game let go of the textures it had
 static volatile LONG g_flagsStale = 1;  // a save was loaded: the Scripts menu flags are read afresh
@@ -449,8 +454,130 @@ static bool LocoAtBothEnds(BYTE* lead)
 // ---------------------------------------------------------------- the flip
 static void Resolve(Train* t, BYTE* lead, INT_PTR wagons, const float* vanPos, float vanYaw, const char* when);
 
+// Trains that have left their wagons at a marked waypoint, one record each,
+// until the wagons are back. The locomotive couples again only once it has
+// run LEFT_AWAY_M (it is turned round right there quite often), the same
+// train does not stop at that waypoint again before it has run AGAIN_M, and
+// on its way round every waypoint counts only once it is there
+// (RR_PassWaypoint). The way run is its speed over the time it moves (it is
+// not drawn, and not counted, while it stands).
+#define LEFT_AWAY_M 40.0f
+#define AGAIN_M     100.0f
+#define LEFT_MAX    64
+struct Left { BYTE* loco; BYTE* wp; float run; DWORD tick; DWORD stood; };
+static Left g_left[LEFT_MAX];
+static int  g_leftCount;
+
+static Left* LeftOf(BYTE* loco)
+{
+    for (int i = 0; i < g_leftCount; ++i) if (g_left[i].loco == loco) return &g_left[i];
+    return 0;
+}
+
+static void LeftAdd(BYTE* loco, BYTE* wp)
+{
+    Left* l = LeftOf(loco);
+    if (!l) {
+        if (g_leftCount == LEFT_MAX) memmove(g_left, g_left + 1, sizeof(Left) * --g_leftCount);   // the oldest goes
+        l = &g_left[g_leftCount++];
+    }
+    l->loco = loco; l->wp = wp; l->run = 0.0f; l->tick = 0; l->stood = 0;
+}
+
+static void LeftForget(BYTE* loco)
+{
+    if (Left* l = LeftOf(loco)) *l = g_left[--g_leftCount];
+}
+
+// Research: a locomotive running round, once a second while it moves.
+static int  g_planFails, g_signalWaits;   // since the last line
+static float ToNode(BYTE* v);
+static bool SignalAt(BYTE* node);
+static void RoundLog(BYTE* v)
+{
+    static DWORD last;
+    if (!cfg.research || GetTickCount() - last < 1000) return;
+    last = GetTickCount();
+    BYTE *sb = 0, *se = 0, *recs = 0, *nb = 0, *ne = 0, *gb = 0, *ge = 0, *seg = 0, *node = 0;
+    int at = -1, idx = -1;
+    float kmh = 0.0f;
+    Rd(v, 0x680, &sb); Rd(v, 0x688, &se); Rd(v, 0x638, &recs); Rd(v, 0x698, &at); Rd(v, V_SPEED, &kmh);
+    Rd(v, 0x6A0, &nb); Rd(v, 0x6A8, &ne); Rd(v, 0x6B8, &gb); Rd(v, 0x6C0, &ge); Rd(v, 0x700, &idx); Rd(v, 0x798, &seg);
+    int n = sb && se > sb ? (int)((se - sb) / 8) : 0, nn = nb && ne > nb ? (int)((ne - nb) / 8) : 0;
+    int ng = gb && ge > gb ? (int)((ge - gb) / 8) : 0;
+    BYTE* stop = at >= 0 && at < n ? ((BYTE**)sb)[at] : 0;
+    if (!stop && at >= 0 && at < n && recs) Rd(recs + (size_t)at * 0x198, 0x190, &node);
+    const char* kind = stop ? "building" : !node ? "?" : SignalAt(node) ? "signal" : "waypoint";
+    BYTE* head = idx >= 0 && idx < nn ? ((BYTE**)nb)[idx] : 0;
+    Logf("railreverse  [round] %p: %.1f km/h, stop %d of %d (%s %p), way %d nodes / %d segments, heading for node %d "
+         "%p%s (%.1f m), %s; planner said no %d times, signal said wait %d times", v, kmh, at + 1, n, kind,
+         stop ? stop : node, nn, ng, idx, head, head && SignalAt(head) ? " (a signal)" : "", ToNode(v),
+         nn && ((BYTE**)nb)[nn - 1] == node ? "its stop ends the way" : "its stop is not the way's end", g_planFails, g_signalWaits);
+    // where the way ends, and the signal there with its "block free" flags (+0x1A8 / +0x1A9, 1 = free)
+    BYTE* endNode = nn ? ((BYTE**)nb)[nn - 1] : 0;
+    BYTE* sig = 0;
+    if (endNode) Rd(endNode, 0xB8, &sig);
+    float ex = 0, ez = 0;
+    if (endNode) { Rd(endNode, 4, &ex); Rd(endNode, 12, &ez); }
+    char flags[64];
+    _snprintf_s(flags, sizeof(flags), _TRUNCATE, "D39 %d D3A %d D3B %d D3C %d", *(v + 0xD39), *(v + 0xD3A),
+                *(v + 0xD3B), *(v + 0xD3C));
+    if (sig) Logf("railreverse  [round]   the way ends at %.0f,%.0f by a signal %p, flags %d %d; %s", ex, ez, sig,
+                  *(sig + 0x1A8), *(sig + 0x1A9), flags);
+    else Logf("railreverse  [round]   the way ends at %.0f,%.0f, no signal there; %s", ex, ez, flags);
+    g_planFails = g_signalWaits = 0;
+}
+
+// Every drawn frame of a lead with a record: add the way it ran since the last one.
+static void LeftRun(BYTE* v)
+{
+    Left* l = LeftOf(v);
+    if (!l) return;
+    DWORD now = GetTickCount();
+    float dt = l->tick ? (now - l->tick) / 1000.0f : 0.0f;
+    if (dt > 0.1f) dt = 0.1f;                              // back from standing: not the whole time it stood
+    l->tick = now;
+    float kmh = 0.0f;
+    Rd(v, V_SPEED, &kmh);
+    float before = l->run;
+    l->run += fabsf(kmh) / 3.6f * dt;
+    if (before < LEFT_AWAY_M && l->run >= LEFT_AWAY_M)
+        Logf("railreverse  [couple] %p: ran %.0f m from its wagons, may couple again", v, LEFT_AWAY_M);
+    if (l->run > 1e6f) l->run = 1e6f;
+    BYTE** lw;
+    if (Wagons(v, &lw) == 0) RoundLog(v);
+}
+
+// Research: any train the game turns round is followed for 30 s (RoundLog).
+static BYTE* g_turned;
+static DWORD g_turnedUntil;
+static BYTE* AheadOf(BYTE* lead, float* at);
+static bool  Couple(BYTE* loco, BYTE* hit, BYTE* hitSeg, float hitAt);
+static void* TrainStop(BYTE* lead, BYTE** wp, int* ord, int* at);
+static int   MarkIndex(BYTE* route, void* key, BYTE* wp, int ord, int kind);
+static BYTE* RouteOf(BYTE* lead);
+static volatile LONG g_marksPending;   // loaded marks wait for their routes (ResolveMarks)
+static void  ResolveMarks(void);
+static int   g_standCount;           // standing consists watched, see StandCheck
+static volatile LONG g_standScan;    // a save was loaded: look for wagons standing on their own
+
+
 static void HookFlip(BYTE* lead, char routeMode, char extend)
 {
+    // Shunting: uncoupled wagons have no route, and the game's reversal
+    // reads one (it reverses them when something stands against them).
+    if (cfg.shunting && lead && *(BYTE**)(lead + 0x6A0) == *(BYTE**)(lead + 0x6A8)) {
+        *(lead + 0xD41) = 0;
+        static BYTE* told;
+        if (told != lead) told = lead, Logf("railreverse  [tail] %p: reversal without a route skipped", lead);
+        return;
+    }
+    // A coupled-back car keeps the flag it got as a lead; it has no segment to turn on.
+    if (cfg.shunting && lead && (*(BYTE**)(lead + V_PARENT) || !*(BYTE**)(lead + 0x798))) {
+        *(lead + 0xD41) = 0;
+        Logf("railreverse  [couple] %p: reversal of a car or of a train off the track skipped", lead);
+        return;
+    }
     // Wagons coupled or left and not settled yet (a distribution office adds
     // them while the train stands inside, then reverses it to send it off).
     // That reversal belongs to the consist change: it does not toggle; the
@@ -464,8 +591,65 @@ static void HookFlip(BYTE* lead, char routeMode, char extend)
         LeaveCriticalSection(&g_lock);
     }
 
+    // Shunting: a locomotive without wagons that the game turns round
+    // against standing wagons (a consist without a locomotive) couples them.
+    BYTE *hit = 0, *hitSeg = 0;
+    float hitAt = 0.0f;
+    BYTE** lw;
+    if (cfg.shunting && lead && Wagons(lead, &lw) == 0 && IsLoco(lead)) {
+        Rd(lead, 0x798, &hitSeg);
+        hit = AheadOf(lead, &hitAt);
+        BYTE* consist = 0;
+        if (hit && Rd(hit, V_PARENT, &consist) && !consist) consist = hit;
+        if (!consist || consist == lead || IsLoco(consist)) hit = 0;
+        Left* left = hit ? LeftOf(lead) : 0;
+        if (left && left->run < LEFT_AWAY_M) {               // turned round right where it left them
+            Logf("railreverse  [couple] %p: against the wagons it has just left - not coupled", lead);
+            hit = 0;
+        }
+    }
+
+    // A train standing at a waypoint marked "stop and turn round" is turned
+    // round by the game there (its way ends there): that stop is done, the
+    // way after the turn is for the next one.
+    bool turnedAtStop = false;
+    if (cfg.shunting && lead && !*(BYTE**)(lead + V_PARENT)) {
+        BYTE* swp = 0;
+        int sord = 0, sat = -1;
+        void* skey = TrainStop(lead, &swp, &sord, &sat);
+        float d = skey && swp ? ToNode(lead) : -1.0f;
+        if (skey && swp && d >= 0.0f && d < 5.0f && MarkIndex(RouteOf(lead), swp, swp, sord, 1) >= 0) {
+            BYTE *sb = 0, *se = 0;
+            Rd(lead, 0x680, &sb); Rd(lead, 0x688, &se);
+            int n = sb && se > sb ? (int)((se - sb) / 8) : 0;
+            if (n > 0) {
+                turnedAtStop = true;
+                *(int*)(lead + 0x698) = (sat + 1) % n;
+                Logf("railreverse  [stop] train %p turned round at its stop-and-turn stop %d: on to stop %d", lead, sat + 1,
+                     (sat + 1) % n + 1);
+            }
+        }
+    }
+
     g_origFlip(lead, routeMode, extend);
 
+    // After a reversal the game gives a short way to the next node with +0xD3A
+    // (carry the way on at that node) and +0xD3B; with both, the last 10 m of
+    // the way are crept at about 1 km/h (FUN_1406a7520). Without +0xD3B the
+    // train runs on to the node at speed and the way is carried on there all
+    // the same: for a locomotive running round and a stop-and-turn train.
+    BYTE** tw;
+    if (cfg.shunting && lead && !*(BYTE**)(lead + V_PARENT) && !hit &&
+        (turnedAtStop || (LeftOf(lead) && Wagons(lead, &tw) == 0)))
+        *(lead + 0xD3B) = 0;
+    if (turnedAtStop) *(float*)(lead + V_SPEED) = 0.0f;   // it sets off from standing
+    if (cfg.research && lead && !*(BYTE**)(lead + V_PARENT)) g_turned = lead, g_turnedUntil = GetTickCount() + 30000;
+    if (cfg.research && lead && !*(BYTE**)(lead + V_PARENT))                   // the way it is given
+        Logf("railreverse  [round] %p turned round (%d, %d): way %d nodes, D39 %d D3A %d D3B %d D3C %d", lead, routeMode,
+             extend, (int)((*(BYTE**)(lead + 0x6A8) - *(BYTE**)(lead + 0x6A0)) / 8), *(lead + 0xD39), *(lead + 0xD3A),
+             *(lead + 0xD3B), *(lead + 0xD3C));
+
+    if (hit) Couple(lead, hit, hitSeg, hitAt);
     ++g_flips;
     if (changed) {
         EnterCriticalSection(&g_lock);
@@ -631,6 +815,11 @@ static void TypeName(BYTE* v, char* out)
     out[i] = 0;
 }
 
+static int  MarksText(char* out, int cap, int* count);   // the route window's uncouple marks, see below
+static void LoadMark(const char* text, int kind);
+static void ClearMarks(void);
+static void ClearWatch(void);
+
 static void SaveSidecar(const char* vehiclesBin)
 {
     char path[MAX_PATH * 2];
@@ -657,7 +846,9 @@ static void SaveSidecar(const char* vehiclesBin)
         ++trains;
     }
     LeaveCriticalSection(&g_lock);
-    if (!trains) {
+    int marks = 0;
+    len += MarksText(buf + len, (int)sizeof(buf) - len, &marks);
+    if (!trains && !marks) {
         DeleteFileA(path);                // nothing to remember: no stale file for the next load
         Logf("railreverse  save: nothing to remember");
         return;
@@ -667,7 +858,7 @@ static void SaveSidecar(const char* vehiclesBin)
     DWORD wrote = 0;
     WriteFile(h, buf, (DWORD)len, &wrote, 0);
     CloseHandle(h);
-    Logf("railreverse  save: %d train(s) -> %s", trains, path);
+    Logf("railreverse  save: %d train(s), %d stop mark(s) -> %s", trains, marks, path);
 }
 
 static void LoadSidecar(const char* vehiclesBin)
@@ -680,6 +871,11 @@ static void LoadSidecar(const char* vehiclesBin)
     g_pendingCount = 0;
     g_pendingLive = 0;
     g_allFreight = g_allPassenger = 0;               // until the Scripts menu flags are read
+    g_leftCount = 0;
+    ClearMarks();
+    ClearWatch();
+    g_standCount = 0;
+    g_standScan = 1;
     g_iconsStale = 1;
     g_flagsStale = 1;
     LeaveCriticalSection(&g_lock);
@@ -702,6 +898,10 @@ static void LoadSidecar(const char* vehiclesBin)
         if (k && line[k - 1] == '\r') line[k - 1] = 0;
         if (!strncmp(line, "freight ", 8) || !strncmp(line, "passenger ", 10)) {
             // 0.4: the class switches were kept here; now the Scripts menu has them
+        } else if (!strncmp(line, "uncouple ", 9)) {
+            LoadMark(line + 9, 0);
+        } else if (!strncmp(line, "reverse ", 8)) {
+            LoadMark(line + 8, 1);
         } else if (g_pendingCount < 512) {
             char* a = strchr(line, ' ');
             char* b = a ? strchr(a + 1, ' ') : 0;
@@ -958,11 +1158,803 @@ static bool LeadXform(BYTE* v, float* pos, float yaw, float pitch)
     return true;
 }
 
+// ---------------------------------------------------------------- route research (ini research_log)
+// Research for shunting: how a train stops behind another one. For a chosen
+// train (Ctrl+F9), twice a second: speed, its route (+0x6A0 track segments,
+// +0x700 the current one), where it is on its segment (+0x798 segment,
+// +0x7A4 position, segment length at +0x11C), how far the route goes, and the
+// first segment ahead on the route that another train stands on (its
+// occupancy ring, +0x7D0: 75 x {segment*, u8 direction}).
+#define V_ROUTE_BEGIN  0x6A0
+#define V_ROUTE_END    0x6A8
+#define V_ROUTE_INDEX  0x700
+#define V_SEGMENT      0x798
+#define V_SEGMENT_POS  0x7A4
+#define V_RING         0x7D0
+#define RING_ENTRIES   75
+#define SEG_LENGTH     0x11C
+
+static float SegLength(BYTE* seg)
+{
+    float l = 0.0f;
+    return Rd(seg, SEG_LENGTH, &l) ? l : 0.0f;
+}
+
+static BYTE* RingOwner(BYTE* seg, BYTE* self)
+{
+    BYTE** b;
+    int n = VehicleCount(&b);
+    for (int i = 0; i < n; ++i) {
+        BYTE* v = b[i];
+        BYTE* parent = 0;
+        if (!v || v == self || !Rd(v, V_PARENT, &parent) || parent) continue;
+        if (!ReadablePtr(v + V_RING, RING_ENTRIES * 16)) continue;
+        for (int k = 0; k < RING_ENTRIES; ++k)
+            if (*(BYTE**)(v + V_RING + k * 16) == seg) return v;
+    }
+    return 0;
+}
+
+static void RouteDebug(BYTE* lead)
+{
+    static DWORD last;
+    EnterCriticalSection(&g_lock);
+    Train* t = Find(lead);
+    bool chosen = t && t->chosen;
+    LeaveCriticalSection(&g_lock);
+    if (!chosen) return;
+    DWORD now = GetTickCount();
+    if (now - last < 500) return;
+    last = now;
+
+    float speed = 0.0f, pos = 0.0f;
+    BYTE *rb = 0, *re = 0, *seg = 0;
+    int idx = -1;
+    Rd(lead, V_SPEED, &speed);
+    Rd(lead, V_ROUTE_BEGIN, &rb);
+    Rd(lead, V_ROUTE_END, &re);
+    Rd(lead, V_ROUTE_INDEX, &idx);
+    Rd(lead, V_SEGMENT, &seg);
+    Rd(lead, V_SEGMENT_POS, &pos);
+    int n = rb && re > rb && ReadablePtr(rb, (size_t)(re - rb)) ? (int)((re - rb) / 8) : 0;
+    BYTE** route = (BYTE**)rb;
+
+    // what is left of the route, and the first segment ahead someone stands on
+    float toEnd = seg ? SegLength(seg) - pos : 0.0f, ahead = toEnd;
+    BYTE* blocker = 0;
+    int blockAt = -1;
+    if (seg) blocker = RingOwner(seg, lead), blockAt = blocker ? idx : -1;
+    for (int i = idx + 1; i >= 1 && i < n && !blocker; ++i) {
+        blocker = RingOwner(route[i], lead);
+        if (blocker) blockAt = i;
+        else ahead += SegLength(route[i]);
+    }
+    for (int i = idx + 1; i >= 1 && i < n; ++i) toEnd += SegLength(route[i]);
+    BYTE* lastSeg = n ? route[n - 1] : 0;
+
+    // the other train: where its own head is, and how far round its ring our segment is
+    BYTE* oseg = 0;
+    float opos = -1.0f;
+    int oring = -1;
+    if (blocker) {
+        Rd(blocker, V_SEGMENT, &oseg);
+        Rd(blocker, V_SEGMENT_POS, &opos);
+        for (int k = 0; k < RING_ENTRIES; ++k)
+            if (*(BYTE**)(blocker + V_RING + k * 16) == seg) { oring = k; break; }
+    }
+
+    Logf("railreverse  [route] train %p: %.1f km/h | segment %p (route[%d] %p) at %.1f of %.1f m | route %d/%d, "
+         "%.1f m to its end, last %p | other train %p on route[%d], %.1f m ahead; its head on %p at %.1f, "
+         "our segment at its ring[%d]",
+         lead, speed, seg, idx, idx >= 0 && idx < n ? route[idx] : 0, pos, SegLength(seg), idx, n, toEnd, lastSeg,
+         blocker, blockAt, blocker ? ahead : -1.0f, oseg, opos, oring);
+}
+
+// ---------------------------------------------------------------- uncoupling (ini shunting)
+// Research for shunting: CTRL+F11 in a train window uncouples the wagons with
+// the game's own split, FUN_1406109d0(_, lead): the locomotives at the front
+// stay, the first other car becomes the lead of a new consist with the rest.
+// Wagons have no track position of their own (FUN_1406a5410 places them back
+// from the lead along its trail, the ring), so the new lead gets one here: the
+// point its front stands at, and the rest of the old lead's trail behind it.
+static const short SIG_SPLIT[] = {
+    0x48,0x89,0x5c,0x24,0x20, 0x48,0x89,0x4c,0x24,0x08, 0x55,0x56,0x57,0x41,0x56,0x41,0x57, 0x48,0x83,0xec,0x20,
+    0x48,0x8b,0xba,0x98,0x03,0x00,0x00, 0x48,0x8b,0xda, 0x48,0x85,0xff, 0x0f,0x84,-1,-1,-1,-1,
+    0x48,0x8b,0x87,0xa8,0x03,0x00,0x00, 0x33,0xed, 0x48,0x2b,0x87,0xa0,0x03,0x00,0x00, 0x48,0xc1,0xf8,0x03,
+};
+#define V_SEGMENT_DIR  0x7A0      // u8
+#define V_SEGS_BEGIN   0x6B8      // route segments vector
+#define V_SEGS_END     0x6C0
+typedef void (*FnSplit)(void*, BYTE*);
+static FnSplit g_split;
+
+// A signal's "block taken" flags (+0x1A8 / +0x1A9) are set and cleared as
+// trains pass it, each time worked out by FUN_14041ec00(world, signal, ...)
+// from who is written in the block's segments. Wagons left standing are
+// written in their segments; sold there, they are struck out of them, but
+// the flags stay "taken" until a train passes. So every standing consist is
+// watched; once it is gone (sold, not coupled: a coupled one is a car now),
+// the signals around the segments it stood on are worked out again, found
+// afresh from the track at that moment (a signal kept for later could be
+// pulled up meanwhile).
+static const short SIG_BLOCKSTATE[] = {
+    0x48,0x89,0x5c,0x24,0x08, 0x48,0x89,0x6c,0x24,0x10, 0x48,0x89,0x74,0x24,0x18, 0x48,0x89,0x7c,0x24,0x20,
+    0x41,0x56, 0x48,0x83,0xec,0x30, 0x4c,0x8b,0x72,0x08, 0x33,0xf6,
+};
+typedef void (*FnBlockState)(void* world, BYTE* signal, char a, char b);
+static FnBlockState g_blockState;
+struct Stand { BYTE* v; BYTE* segs[16]; int n; };
+static Stand g_stand[16];
+
+static void StandAdd(BYTE* v)
+{
+    if (g_standCount >= 16) return;
+    Stand& st = g_stand[g_standCount++];
+    st.v = v; st.n = 0;
+    BYTE* seg = *(BYTE**)(v + V_SEGMENT);
+    if (seg) st.segs[st.n++] = seg;
+    for (int k = 0; k < RING_ENTRIES && st.n < 16; ++k) {
+        BYTE* r = *(BYTE**)(v + V_RING + k * 16);
+        if (!r) break;
+        bool seen = false;
+        for (int j = 0; j < st.n; ++j) seen |= st.segs[j] == r;
+        if (!seen) st.segs[st.n++] = r;
+    }
+}
+
+// The signals bounding the block of these segments: walked over the nodes
+// (+0x20 / +0x28 a segment's ends, +0x28 a node's segments) up to signals.
+static int BlockSignals(BYTE* const* start, int nstart, BYTE** sig, int cap)
+{
+    BYTE* block[64];
+    int nblock = 0, nsig = 0;
+    for (int i = 0; i < nstart && nblock < 64; ++i) block[nblock++] = start[i];
+    for (int q = 0; q < nblock; ++q) {
+        for (int end = 0; end < 2; ++end) {
+            BYTE* node = 0;
+            if (!ReadablePtr(block[q], 0x48) || !Rd(block[q], end ? 0x28 : 0x20, &node) || !node) continue;
+            if (SignalAt(node)) {
+                BYTE* sg = *(BYTE**)(node + 0xB8);
+                bool seen = false;
+                for (int k = 0; k < nsig; ++k) seen |= sig[k] == sg;
+                if (!seen && nsig < cap) sig[nsig++] = sg;
+                continue;
+            }
+            BYTE *sb = 0, *se = 0;
+            if (!Rd(node, 0x28, &sb) || !Rd(node, 0x30, &se) || !sb || se <= sb || !ReadablePtr(sb, (size_t)(se - sb))) continue;
+            for (BYTE** sp = (BYTE**)sb; sp < (BYTE**)se && nblock < 64; ++sp) {
+                bool seen = false;
+                for (int k = 0; k < nblock && !seen; ++k) seen = block[k] == *sp;
+                if (*sp && !seen) block[nblock++] = *sp;
+            }
+        }
+    }
+    return nsig;
+}
+
+static bool StandingWagons(BYTE* v);
+
+// After a load: the wagons left standing in the save.
+static void StandScan(void)
+{
+    BYTE** veh;
+    int nv = VehicleCount(&veh), found = 0;
+    if (nv <= 0) return;
+    g_standScan = 0;
+    for (int k = 0; k < nv; ++k)
+        if (veh[k] && *(BYTE**)(veh[k] + V_SEGMENT) && StandingWagons(veh[k])) { StandAdd(veh[k]); ++found; }
+    if (found) Logf("railreverse  load: %d consist(s) of wagons standing on their own", found);
+}
+
+static void StandCheck(void)
+{
+    static DWORD last;
+    if (!g_standCount || GetTickCount() - last < 500) return;
+    last = GetTickCount();
+    BYTE** veh;
+    int nv = VehicleCount(&veh);
+    for (int i = 0; i < g_standCount; ++i) {
+        Stand& st = g_stand[i];
+        bool alive = false;
+        for (int k = 0; k < nv && !alive; ++k) alive = veh[k] == st.v;
+        BYTE* parent = 0;
+        if (alive && Rd(st.v, V_PARENT, &parent) && !parent) continue;   // still standing on its own
+        if (!alive && g_blockState) {                                      // sold: the signals around it afresh
+            BYTE* sig[16];
+            int ns = BlockSignals(st.segs, st.n, sig, 16);
+            for (int k = 0; k < ns; ++k) g_blockState(g_exeBase + RVA_WORLD, sig[k], 1, 1);
+            Logf("railreverse  [stop] wagons %p gone (sold): %d signal(s) around them worked out again", st.v, ns);
+        }
+        g_stand[i] = g_stand[--g_standCount];                             // gone, or coupled: no more watching
+        --i;
+    }
+}
+
+static void Uncouple(BYTE* lead)
+{
+    // Pushing, the locomotive is drawn at the back but is the game's front:
+    // reverse first (same picture, now pulling), so it leaves from where it is seen.
+    if (IsPushing(lead)) {
+        HookFlip(lead, 1, 0);
+        Logf("railreverse  [uncouple] train %p was pushing: reversed first, %s now", lead,
+             IsPushing(lead) ? "still pushing" : "pulling");
+    }
+    BYTE** w;
+    int n = Wagons(lead, &w);
+    BYTE* seg = 0;
+    float pos = 0.0f;
+    if (!g_split || n <= 0 || !Rd(lead, V_SEGMENT, &seg) || !seg || !Rd(lead, V_SEGMENT_POS, &pos) ||
+        !ReadablePtr(lead + V_RING, RING_ENTRIES * 16)) {
+        Logf("railreverse  [uncouple] train %p: nothing to do (%d wagons, segment %p)", lead, n, seg);
+        return;
+    }
+    BYTE* before[1024];
+    memcpy(before, w, (size_t)n * 8);
+    BYTE dir = *(lead + V_SEGMENT_DIR);
+    BYTE ring[RING_ENTRIES * 16];
+    memcpy(ring, lead + V_RING, sizeof(ring));
+
+    g_split(0, lead);
+    int kept = Wagons(lead, &w);
+    if (kept < 0 || kept >= n) {
+        Logf("railreverse  [uncouple] train %p: the game kept all %d wagons", lead, n);
+        return;
+    }
+    BYTE* tail = before[kept];
+
+    // Where the tail's front stands: that far back from the lead's front.
+    float back = CarLength(lead);
+    for (int i = 0; i < kept; ++i) back += CarLength(before[i]);
+    float at = pos - back;
+    int k = 0;
+    while (at < 0.0f && k < RING_ENTRIES && *(BYTE**)(ring + k * 16)) {
+        seg = *(BYTE**)(ring + k * 16);
+        dir = ring[k * 16 + 8];
+        at += SegLength(seg);
+        ++k;
+    }
+    if (at < 0.0f) Logf("railreverse  [uncouple] trail too short, %.1f m missing", -at);
+
+    *(BYTE**)(tail + V_SEGMENT) = seg;
+    *(tail + V_SEGMENT_DIR) = dir;
+    *(float*)(tail + V_SEGMENT_POS) = at < 0.0f ? 0.0f : at;
+    memset(tail + V_RING, 0, sizeof(ring));
+    memcpy(tail + V_RING, ring + k * 16, (size_t)(RING_ENTRIES - k) * 16);
+    *(float*)(tail + V_SPEED) = 0.0f;
+    *(BYTE**)(tail + V_ROUTE_END) = *(BYTE**)(tail + V_ROUTE_BEGIN);
+    *(BYTE**)(tail + V_SEGS_END) = *(BYTE**)(tail + V_SEGS_BEGIN);
+    *(int*)(tail + V_ROUTE_INDEX) = 0;      // a wagon keeps -1 there, the rail update reads route[index] (FUN_1406a7520)
+    *(tail + 0xD41) = 0;                    // the reverse button: a wagon may carry it, see HookFlip
+
+    BYTE** tb;
+    Logf("railreverse  [uncouple] train %p: kept %d of %d wagons; new consist %p (%d wagons) at %.1f m of segment %p "
+         "dir %d, %.1f m back, trail from ring[%d]",
+         lead, kept, n, tail, Wagons(tail, &tb), at, seg, dir, back, k);
+    StandAdd(tail);
+}
+
+
+// The game's obstacle lookup: the car at a point of a track segment
+// (FUN_1405219e0, its map at DAT_1409e4818). 1.1.1.9 addresses (off on another build).
+#define RVA_VEHICLE_AT 0x5219E0
+#define RVA_TRACK_MAP  0x9E4818
+typedef BYTE* (*FnVehicleAt)(void* map, BYTE* seg, char dir, float at, void* node, int index);
+static const BYTE VEHICLE_AT_HEAD[] = { 0x48,0x89,0x5c,0x24,0x20, 0x48,0x89,0x4c,0x24,0x08, 0x55,0x56,0x57, 0x48,0x83,0xec,0x60 };
+
+static const short SIG_COUPLE[] = {     // FUN_1403fe3c0(_, a, b): b and its wagons go behind a's
+    0x48,0x85,0xd2, 0x0f,0x84,-1,-1,-1,-1, 0x4c,0x89,0x44,0x24,0x18, 0x48,0x89,0x4c,0x24,0x08, 0x41,0x56,
+    0x48,0x83,0xec,0x30, 0x4c,0x8b,0xf2, 0x4d,0x85,0xc0, 0x0f,0x84,-1,-1,-1,-1, 0x48,0x89,0x5c,0x24,0x48,
+    0x48,0x8d,0x9a,0xa0,0x03,0x00,
+};
+typedef void (*FnCouple)(void*, BYTE*, BYTE*);
+static FnCouple g_couple3;
+
+static const short SIG_UNRESERVE[] = {  // FUN_140681970(vehicle): out of every segment it holds (+0x7B8),
+                                        // then written into its current one (+0x798) again, if any
+    0x48,0x89,0x5c,0x24,0x10, 0x48,0x89,0x6c,0x24,0x18, 0x48,0x89,0x74,0x24,0x20, 0x57, 0x41,0x54, 0x41,0x56,
+    0x48,0x83,0xec,0x20, 0x48,0x8d,0xb1,0xb8,0x07,0x00,0x00, 0x4c,0x89,0x7c,0x24,0x40, 0x48,0x8b,0x46,0x08,
+};
+typedef void (*FnUnreserve)(BYTE*);
+static FnUnreserve g_unreserve;
+
+// Signals. A lead writes itself into the segments it stands on (segment
+// +0x38 vector, its own +0x7B8; FUN_1406a6f50), and the way planner
+// (FUN_1406b8eb0) plans no way through a segment someone else is written in:
+// the train waits at the signal. Standing wagons are such a someone. For a
+// locomotive without wagons they are struck out while it plans, and written
+// back right after: it may run up to them and couple; any other train waits.
+static const short SIG_OCCUPY[] = {     // FUN_1406a6f50(lead): into its segment and its trail's
+    0x40,0x56, 0x57, 0x41,0x54, 0x41,0x56, 0x41,0x57, 0x48,0x83,0xec,0x20, 0x49,0x83,0xcf,0xff,
+    0x48,0x89,0x5c,0x24,0x50, 0x4c,0x8b,0xf1, 0x48,0x89,0x6c,0x24,0x60, 0x48,0x8d,
+};
+static const short SIG_PLAN[] = {       // FUN_1406b8eb0(lead, ...): plan its way
+    0x48,0x8b,0xc4, 0x88,0x50,0x10, 0x55, 0x56, 0x57, 0x41,0x54, 0x41,0x55, 0x41,0x56, 0x41,0x57,
+    0x48,0x8d,0x68,0xa1, 0x48,0x81,0xec,0xe0,0x00,0x00,0x00, 0x48,0xc7,0x45,0x9f,0xfe,0xff,0xff,0xff,
+};
+#define PLAN_STOLEN 17
+typedef void (*FnOccupy)(BYTE*);
+typedef unsigned long long (*FnPlan)(BYTE* lead, char a, char b, void* c);
+static FnOccupy g_occupy;
+static FnPlan   g_origPlan;
+
+// Wagons standing on their own: a lead with no locomotive in the consist, not in a building.
+static bool StandingWagons(BYTE* v)
+{
+    BYTE *parent = (BYTE*)1, *building = (BYTE*)1, **w;
+    if (!Rd(v, V_PARENT, &parent) || parent || !Rd(v, V_BUILDING, &building) || building) return false;
+    if (Category(v) == CAT_LOCOMOTIVE) return false;   // the game may plan it a way: it cannot go anyway
+    int n = Wagons(v, &w);
+    for (int i = 0; i < n; ++i) if (Category(w[i]) == CAT_LOCOMOTIVE) return false;
+    return n >= 0;
+}
+
+// The signal itself: FUN_1406ac6e0(lead) answers whether the train may go
+// past the signal at the node it heads for (+0x6A0[+0x700], the node's +0xB8
+// is the signal, its +0x14 the kind, 10 = none). A locomotive without wagons
+// that is told to wait may go anyway when all that stands in the block behind
+// the signal (its way up to the next signal) is wagons without a locomotive.
+static const short SIG_SIGNAL[] = {
+    0x40,0x53, 0x48,0x83,0xec,0x70, 0x80,0xb9,0xe0,0x05,0x00,0x00,0x00, 0x48,0x8b,0xd9, 0x74,0x08, 0xb0,0x01,
+    0x48,0x83,0xc4,0x70, 0x5b, 0xc3, 0x48,0x8b,0x81,0xa8,0x06,0x00,
+};
+#define SIGNAL_STOLEN 16
+typedef char (*FnSignal)(BYTE* lead);
+static FnSignal g_origSignal;
+
+static bool SignalAt(BYTE* node)
+{
+    BYTE* sig = 0;
+    int kind = 10;
+    return node && Rd(node, 0xB8, &sig) && sig && Rd(sig, 0x14, &kind) && kind != 10;
+}
+
+// A chain signal (+0x1AA 1 ... 3): the game's check looks past it along the
+// way to the next block (FUN_1406ac6e0), so a block it bounds goes on there.
+static bool ChainAt(BYTE* node)
+{
+    BYTE* sig = 0;
+    BYTE type = 0;
+    return SignalAt(node) && Rd(node, 0xB8, &sig) && Rd(sig, 0x1AA, &type) && (BYTE)(type - 1) < 3;
+}
+
+static bool StandingWagons(BYTE* v);
+
+static BYTE* g_watch;
+static void ClearWatch(void) { g_watch = 0; }
+
+// After a coupling the cars must not be written in any segment; one was found
+// written again a moment after (not known yet by whom). For 10 s every frame
+// the new train's segments are checked and such a car struck out.
+static DWORD g_watchUntil;
+
+static void WatchCars(void)
+{
+    if (!g_watch || !g_unreserve) return;
+    if ((int)(GetTickCount() - g_watchUntil) > 0) { g_watch = 0; return; }
+    BYTE* v = g_watch;
+    BYTE** veh;                                            // still there (track pulled up, train sold)
+    int n = VehicleCount(&veh), i = 0;
+    while (i < n && veh[i] != v) ++i;
+    if (i >= n) { g_watch = 0; return; }
+    for (int k = -1; k < RING_ENTRIES; ++k) {
+        BYTE* seg = k < 0 ? *(BYTE**)(v + V_SEGMENT) : *(BYTE**)(v + V_RING + k * 16);
+        if (!seg) break;
+        BYTE *ob = 0, *oe = 0;
+        Rd(seg, 0x38, &ob); Rd(seg, 0x40, &oe);
+        for (BYTE** o = (BYTE**)ob; ob && o < (BYTE**)oe; ++o) {
+            BYTE* parent = 0;
+            if (*o && Rd(*o, V_PARENT, &parent) && parent) {
+                Logf("railreverse  [couple] car %p (of %p) written in segment %p again, %u ms after coupling: struck out",
+                     *o, parent, seg, 10000 - (g_watchUntil - GetTickCount()));
+                g_unreserve(*o);
+                return;                                    // the vector changed under us: next frame for the rest
+            }
+        }
+    }
+}
+
+// Research: why a locomotive running round was not let past, once a second.
+// Research: the signal nodes the last block walk stopped at, and the entry.
+static BYTE* g_walkStops[8];
+static int   g_walkStopCount;
+static BYTE* g_walkEntry;
+
+static void SignalDesc(BYTE* node, char* out, size_t cap)
+{
+    BYTE* sig = 0;
+    int kind = -1;
+    BYTE t8 = 0, t9 = 0, ta = 0, tb = 0, tc = 0;
+    if (node) Rd(node, 0xB8, &sig);
+    if (sig) { Rd(sig, 0x14, &kind); Rd(sig, 0x1A8, &t8); Rd(sig, 0x1A9, &t9); Rd(sig, 0x1AA, &ta); Rd(sig, 0x1AB, &tb); Rd(sig, 0x1AC, &tc); }
+    _snprintf_s(out, cap, _TRUNCATE, "node %p signal %p kind %d, 1A8..1AC %d %d %d %d %d", node, sig, kind, t8, t9, ta, tb, tc);
+}
+
+static void SignalWhy(BYTE* lead, const char* why, BYTE* v, BYTE** block, int nblock)
+{
+    static DWORD last;
+    if (!cfg.research || !LeftOf(lead) || GetTickCount() - last < 1000) return;
+    last = GetTickCount();
+    char line[1024];
+    int len = _snprintf_s(line, sizeof(line), _TRUNCATE, "railreverse  [signal] locomotive %p waits: %s", lead, why);
+    if (v) {
+        BYTE *seg = 0, *bld = 0, **w;
+        Rd(v, V_SEGMENT, &seg); Rd(v, V_BUILDING, &bld);
+        len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " %p (%d wagons, category %d, %s, building %p, on %p)",
+                           v, Wagons(v, &w), Category(v), IsLoco(v) ? "locomotive" : "car", bld, seg);
+    }
+    len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, "; block:");
+    for (int b = 0; b < nblock && len > 0 && len < 900; ++b)
+        len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " %p", block[b]);
+    // and where the wagons left by this locomotive are
+    BYTE** veh;
+    int n = VehicleCount(&veh);
+    for (int i = 0; i < n && len > 0 && len < 900; ++i) {
+        BYTE* t = veh[i];
+        if (!t || !StandingWagons(t)) continue;
+        BYTE* seg = 0;
+        float pos = 0.0f;
+        Rd(t, V_SEGMENT, &seg); Rd(t, V_SEGMENT_POS, &pos);
+        len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, "; wagons %p on %p at %.1f, trail %p", t, seg, pos,
+                           *(BYTE**)(t + V_RING));
+    }
+    Logf("%s", line);
+    char d[200];
+    SignalDesc(g_walkEntry, d, sizeof(d));
+    Logf("railreverse  [signal]   entry: %s", d);
+    for (int k = 0; k < g_walkStopCount; ++k) {
+        SignalDesc(g_walkStops[k], d, sizeof(d));
+        Logf("railreverse  [signal]   stopped at: %s", d);
+    }
+}
+
+static char HookSignal(BYTE* lead)
+{
+    char go = g_origSignal(lead);
+    if (!go && lead && LeftOf(lead)) ++g_signalWaits;
+    BYTE** w;
+    if (go || !lead || !cfg.shunting || *(BYTE**)(lead + V_PARENT) || Wagons(lead, &w) != 0 || !IsLoco(lead)) return go;
+
+    // the block behind the signal: from the segment past it, every segment
+    // reached without going by another signal, points included (the way the
+    // train has planned may end before the block does). A segment's ends are
+    // nodes (+0x20, +0x28), a node's segments the vector at +0x28.
+    BYTE *nb = 0, *ne = 0, *gb = 0, *ge = 0;
+    int idx = -1;
+    Rd(lead, V_ROUTE_BEGIN, &nb); Rd(lead, V_ROUTE_END, &ne); Rd(lead, V_SEGS_BEGIN, &gb); Rd(lead, V_SEGS_END, &ge);
+    Rd(lead, V_ROUTE_INDEX, &idx);
+    int nn = nb && ne > nb ? (int)((ne - nb) / 8) : 0, ng = gb && ge > gb ? (int)((ge - gb) / 8) : 0;
+    if (idx < 0 || idx >= ng || idx >= nn || !ReadablePtr(nb, (size_t)nn * 8) || !ReadablePtr(gb, (size_t)ng * 8)) return go;
+    BYTE* entry = ((BYTE**)nb)[idx];
+    g_walkEntry = entry;
+    g_walkStopCount = 0;
+    // Waiting at a chain signal: the game looks on to the next block (FUN_1406ac6e0),
+    // so the walk goes on past the next signal on the locomotive's way too.
+    // only the first signal past it: one block more, not the whole way
+    BYTE* past = 0;
+    for (int j = idx + 1; ChainAt(entry) && j < nn && !past; ++j)
+        if (SignalAt(((BYTE**)nb)[j]) && !ChainAt(((BYTE**)nb)[j])) past = ((BYTE**)nb)[j];
+    BYTE* block[64];
+    int nblock = 0;
+    block[nblock++] = ((BYTE**)gb)[idx];
+    for (int q = 0; q < nblock; ++q) {
+        for (int end = 0; end < 2; ++end) {
+            BYTE* node = 0;
+            // a chain signal does not end the block: the wagons may stand beyond it
+            if (!Rd(block[q], end ? 0x28 : 0x20, &node) || !node || node == entry) continue;
+            if (SignalAt(node) && !ChainAt(node) && node != past) {
+                bool seen = false;
+                for (int k = 0; k < g_walkStopCount; ++k) seen |= g_walkStops[k] == node;
+                if (!seen && g_walkStopCount < 8) g_walkStops[g_walkStopCount++] = node;
+                continue;
+            }
+            BYTE *sb = 0, *se = 0;
+            if (!Rd(node, 0x28, &sb) || !Rd(node, 0x30, &se) || !sb || se <= sb || !ReadablePtr(sb, (size_t)(se - sb))) continue;
+            for (BYTE** sp = (BYTE**)sb; sp < (BYTE**)se && nblock < 64; ++sp) {
+                bool seen = false;
+                for (int b = 0; b < nblock && !seen; ++b) seen = block[b] == *sp;
+                if (*sp && !seen) block[nblock++] = *sp;
+            }
+        }
+    }
+
+    // who stands there: a train's segment and as much of its trail as it is
+    // long (the trail goes on far behind it)
+    BYTE** veh;
+    int n = VehicleCount(&veh), wagons = 0;
+    for (int i = 0; i < n; ++i) {
+        BYTE* v = veh[i];
+        if (!v || v == lead || *(BYTE**)(v + V_PARENT) || *(BYTE**)(v + V_BUILDING)) continue;
+        BYTE** vw;
+        float rest = 0.0f, len = CarLength(v);
+        int nw = Wagons(v, &vw);
+        for (int k = 0; k < nw; ++k) len += CarLength(vw[k]);
+        Rd(v, V_SEGMENT_POS, &rest);
+        rest -= len;
+        bool there = false;
+        for (int k = -1; k < RING_ENTRIES && !there; ++k) {
+            BYTE* seg = k < 0 ? *(BYTE**)(v + V_SEGMENT) : *(BYTE**)(v + V_RING + k * 16);
+            if (!seg || (k >= 0 && rest >= 0.0f)) break;
+            if (k >= 0) rest += SegLength(seg);
+            for (int b = 0; b < nblock && !there; ++b) there = seg == block[b];
+        }
+        if (!there) continue;
+        if (!StandingWagons(v)) {                          // a train: wait, as the game says
+            SignalWhy(lead, "a train in the block", v, block, nblock);
+            return go;
+        }
+        ++wagons;
+    }
+    if (!wagons) { SignalWhy(lead, "nothing found in the block", 0, block, nblock); return go; }
+    static BYTE* told;
+    if (told != lead) {
+        told = lead;
+        Logf("railreverse  [signal] locomotive %p goes past the signal: only %d consist(s) of wagons in the block "
+             "(%d segments)", lead, wagons, nblock);
+    }
+    return 1;
+}
+
+static unsigned long long HookPlan(BYTE* lead, char a, char b, void* c)
+{
+    BYTE* struck[64];
+    int ns = 0;
+    BYTE** w;
+    if (lead && cfg.shunting && !*(BYTE**)(lead + V_PARENT) && Wagons(lead, &w) == 0 && IsLoco(lead)) {
+        BYTE** veh;
+        int n = VehicleCount(&veh);
+        for (int i = 0; i < n && ns < 64; ++i) {
+            BYTE* v = veh[i];
+            if (!v || v == lead || *(BYTE**)(v + 0x7C0) == *(BYTE**)(v + 0x7B8) || !StandingWagons(v)) continue;
+            BYTE* seg = *(BYTE**)(v + V_SEGMENT);           // out of its own segment too
+            *(BYTE**)(v + V_SEGMENT) = 0;
+            g_unreserve(v);
+            *(BYTE**)(v + V_SEGMENT) = seg;
+            struck[ns++] = v;
+        }
+    }
+    unsigned long long r = g_origPlan(lead, a, b, c);
+    if ((r & 0xFF) == 0 && lead && LeftOf(lead)) ++g_planFails;
+    // written back only while still standing on their own: the planner may
+    // turn the locomotive round, and turned round against them it couples them
+    for (int i = 0; i < ns; ++i) if (StandingWagons(struck[i])) g_occupy(struck[i]);
+
+    // research: a light locomotive that got no way - who is written in the segments around it
+    if (lead && cfg.research && !*(BYTE**)(lead + V_PARENT) && Wagons(lead, &w) == 0 && IsLoco(lead) &&
+        ((r & 0xFF) == 0 || *(BYTE**)(lead + 0x6A0) == *(BYTE**)(lead + 0x6A8))) {
+        static DWORD last;
+        if (GetTickCount() - last > 3000) {
+            last = GetTickCount();
+            char line[1024];
+            int len = _snprintf_s(line, sizeof(line), _TRUNCATE, "railreverse  [plan] locomotive %p got no way (%llu), "
+                                  "struck %d; written in its segment and trail:", lead, r, ns);
+            for (int k = -1; k < RING_ENTRIES && len > 0 && len < 900; ++k) {
+                BYTE* seg = k < 0 ? *(BYTE**)(lead + V_SEGMENT) : *(BYTE**)(lead + V_RING + k * 16);
+                if (!seg) break;
+                BYTE *ob = 0, *oe = 0;
+                Rd(seg, 0x38, &ob); Rd(seg, 0x40, &oe);
+                int no = ob && oe > ob ? (int)((oe - ob) / 8) : 0;
+                for (int i = 0; i < no && i < 4; ++i) {
+                    BYTE* o = ((BYTE**)ob)[i];
+                    BYTE** ow;
+                    len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " seg%d:%p(%s%s,%d wagons)", k, o,
+                                       o == lead ? "self" : IsLoco(o) ? "loco" : "other",
+                                       o && StandingWagons(o) ? " standing" : "", o ? Wagons(o, &ow) : -1);
+                }
+            }
+            Logf("%s", line);
+            // and who is written where the standing wagons are
+            BYTE** veh;
+            int nv = VehicleCount(&veh);
+            for (int j = 0; j < nv; ++j) {
+                BYTE* t = veh[j];
+                if (!t || !StandingWagons(t)) continue;
+                len = _snprintf_s(line, sizeof(line), _TRUNCATE, "railreverse  [plan]   wagons %p (holds %d segments):", t,
+                                  (int)((*(BYTE**)(t + 0x7C0) - *(BYTE**)(t + 0x7B8)) / 8));
+                for (int k = -1; k < RING_ENTRIES && len > 0 && len < 900; ++k) {
+                    BYTE* seg = k < 0 ? *(BYTE**)(t + V_SEGMENT) : *(BYTE**)(t + V_RING + k * 16);
+                    if (!seg) break;
+                    BYTE *ob = 0, *oe = 0;
+                    Rd(seg, 0x38, &ob); Rd(seg, 0x40, &oe);
+                    int no = ob && oe > ob ? (int)((oe - ob) / 8) : 0;
+                    len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " seg%d %p:", k, seg);
+                    for (int i = 0; i < no && i < 4; ++i) {
+                        BYTE* o = ((BYTE**)ob)[i];
+                        len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " %p%s", o,
+                                           o == t ? "(itself)" : o == lead ? "(this locomotive)" : IsLoco(o) ? "(a locomotive)" : "");
+                    }
+                }
+                Logf("%s", line);
+            }
+        }
+    }
+    static BYTE* told;
+    if (cfg.research && ns && told != lead) {
+        told = lead;
+        Logf("railreverse  [plan] locomotive %p plans past %d standing consist(s) of wagons", lead, ns);
+    }
+    return r;
+}
+
+// The car this far in front of a lead (the game looks 1.5 m, 6.5 m, ... 31.5 m ahead).
+static BYTE* AheadAt(BYTE* lead, float ahead, float* at)
+{
+    if (memcmp(g_exeBase + RVA_VEHICLE_AT, VEHICLE_AT_HEAD, sizeof(VEHICLE_AT_HEAD)) != 0) return 0;
+    BYTE* seg = 0;
+    float pos = 0.0f;
+    if (!Rd(lead, V_SEGMENT, &seg) || !seg || !Rd(lead, V_SEGMENT_POS, &pos)) return 0;
+    char dir = (char)*(lead + V_SEGMENT_DIR);
+    *at = dir ? SegLength(seg) - pos - ahead : pos + ahead;
+    return ((FnVehicleAt)(g_exeBase + RVA_VEHICLE_AT))(*(void**)(g_exeBase + RVA_TRACK_MAP), seg, dir, *at, 0, 0);
+}
+
+static BYTE* AheadOf(BYTE* lead, float* at) { return AheadAt(lead, 1.5f, at); }
+
+// A locomotive without wagons running up to standing wagons: the game slows
+// any train down to 50, 40, ... 10, 3 km/h when something stands 31.5, 26.5,
+// ... 6.5 m ahead (FUN_1406a7520); for coupling it runs up faster, and
+// walks only the last 3 m (the speeds were tried in game).
+static void Approach(BYTE* lead)
+{
+    static const float cap[7] = { 0.0f, 3.0f, 10.0f, 20.0f, 30.0f, 40.0f, 50.0f };   // the game's, 1.5 + 5k m ahead
+    BYTE** w;
+    if (Wagons(lead, &w) != 0 || !IsLoco(lead)) return;
+    float v = 0.0f, at;
+    Rd(lead, V_SPEED, &v);
+    if (v < 0.5f) return;
+    // where the wagons begin: the game's 5 m steps, then half metres inside the step
+    float d = -1.0f;
+    int k = 0;
+    for (; k <= 6 && d < 0.0f; ++k) {
+        BYTE* hit = AheadAt(lead, 1.5f + 5.0f * k, &at);
+        if (!hit) continue;
+        BYTE* consist = 0;
+        if (Rd(hit, V_PARENT, &consist) && !consist) consist = hit;
+        if (!consist || consist == lead || IsLoco(consist)) return;          // a train: as the game does
+        if (k == 0) return;                                                  // at them: the game stops it
+        d = 1.5f + 5.0f * k;
+        for (float x = d - 4.5f; x < d; x += 0.5f)
+            if (AheadAt(lead, x, &at)) { d = x; break; }
+    }
+    if (d < 0.0f) return;
+    --k;                                                   // the game's step: its cap
+    // tried in game: fast up to 3 m, then a walk
+    float ours = d <= 3.0f ? 3.5f : d <= 11.5f ? 15.0f : d <= 16.5f ? 35.0f : d <= 21.5f ? 40.0f : d <= 26.5f ? 45.0f : 55.0f;
+    if (d <= 3.0f) { if (v > ours) *(float*)(lead + V_SPEED) = ours; }   // down to a walk at once
+    else if (v >= cap[k] * 0.9f && v < ours) *(float*)(lead + V_SPEED) = ours;
+}
+
+// Right after the game turned the light locomotive away from the wagons it
+// stood against: couple them behind it and give it a trail over them, the
+// wagons are placed back from the lead along that trail. Touching the first
+// car, the order stays; touching the last one (it ran round), the order and
+// every car's direction turn over. The lookup names the consist, not the car
+// (always its lead), so the end is told by where the touch is: hitAt on
+// hitSeg, a point along the segment from its start.
+static bool Couple(BYTE* loco, BYTE* hit, BYTE* hitSeg, float hitAt)
+{
+    BYTE* hitParent = 0;
+    Rd(hit, V_PARENT, &hitParent);
+    BYTE* tail = hitParent ? hitParent : hit;
+    BYTE** w;
+    int n = Wagons(tail, &w);
+    if (n < 0 || !g_couple3) {
+        Logf("railreverse  [couple] %p: touches %p (its train %p), not the wagons %p - not coupled",
+             loco, hit, hitParent, tail);
+        return false;
+    }
+
+    // The wagons' segments, front to back: the tail's own and its trail over its length.
+    BYTE* segs[RING_ENTRIES + 1];
+    BYTE dirs[RING_ENTRIES + 1];
+    int m = 0;
+    float len = CarLength(tail), pos = 0.0f;
+    for (int i = 0; i < n; ++i) len += CarLength(w[i]);
+    Rd(tail, V_SEGMENT, &segs[0]);
+    Rd(tail, V_SEGMENT_POS, &pos);
+    dirs[0] = *(tail + V_SEGMENT_DIR);
+    for (float rest = pos - len; rest < 0.0f && m < RING_ENTRIES && *(BYTE**)(tail + V_RING + m * 16); ++m) {
+        segs[m + 1] = *(BYTE**)(tail + V_RING + m * 16);
+        dirs[m + 1] = *(tail + V_RING + m * 16 + 8);
+        rest += SegLength(segs[m + 1]);
+    }
+    int count = m + 1;
+
+    // Which end it touches: the nearer one, a point on a segment from its start.
+    float rest = pos - len;
+    for (int i = 1; i < count; ++i) rest += SegLength(segs[i]);
+    float frontAt = dirs[0] ? SegLength(segs[0]) - pos : pos;
+    float rearAt  = dirs[count - 1] ? SegLength(segs[count - 1]) - rest : rest;
+    float toFront = hitSeg == segs[0] ? fabsf(hitAt - frontAt) : 1e9f;
+    float toRear  = hitSeg == segs[count - 1] ? fabsf(hitAt - rearAt) : 1e9f;
+    bool front = toFront <= toRear;
+    if ((front ? toFront : toRear) > 10.0f) {
+        Logf("railreverse  [couple] %p: touches the wagons at %.1f of %p, but their ends are at %.1f of %p and "
+             "%.1f of %p - not coupled", loco, hitAt, hitSeg, frontAt, segs[0], rearAt, segs[count - 1]);
+        return false;
+    }
+    bool rear = !front;
+
+    // The locomotive's trail: those segments as it runs away from them.
+    BYTE* lseg = 0;
+    float lpos = 0.0f;
+    Rd(loco, V_SEGMENT, &lseg);
+    Rd(loco, V_SEGMENT_POS, &lpos);
+    BYTE ring[RING_ENTRIES * 16];
+    memset(ring, 0, sizeof(ring));
+    int r = 0;
+    for (int j = 0; j < count && r < RING_ENTRIES; ++j) {
+        int i = front ? j : count - 1 - j;
+        if (r == 0 && segs[i] == lseg) continue;
+        *(BYTE**)(ring + r * 16) = segs[i];
+        ring[r * 16 + 8] = front ? dirs[i] : (BYTE)!dirs[i];
+        ++r;
+    }
+
+    // The wagons stop being a train: what they held is let go, as the game
+    // does when a lead becomes a car (else the next train waits there); with
+    // no current segment, so they are not written into that one again. The
+    // locomotive gets a new trail: out of the segments of its old one first,
+    // into those of the new one after.
+    *(BYTE**)(tail + V_SEGMENT) = 0;
+    if (g_unreserve) g_unreserve(tail);
+    if (g_unreserve) g_unreserve(loco);
+    g_couple3(0, loco, tail);
+    BYTE** lw;
+    int ln = Wagons(loco, &lw);
+    if (rear && ln > 0) {
+        for (int i = 0, j = ln - 1; i < j; ++i, --j) { BYTE* x = lw[i]; lw[i] = lw[j]; lw[j] = x; }
+        for (int i = 0; i < ln; ++i) *(lw[i] + V_REVERSED) = !*(lw[i] + V_REVERSED);
+    }
+    memcpy(loco + V_RING, ring, sizeof(ring));
+    if (g_occupy) g_occupy(loco);
+    *(short*)(loco + 0xD3A) = 1;                           // a new train: its way planned again at once
+    g_watch = loco;
+    g_watchUntil = GetTickCount() + 10000;
+    *(BYTE**)(tail + V_SEGMENT) = 0;
+    *(int*)(tail + V_ROUTE_INDEX) = -1;
+    memset(tail + V_RING, 0, sizeof(ring));
+    *(tail + 0xD41) = 0;                    // blocked by the locomotive it had asked to reverse
+    *(float*)(tail + V_SPEED) = 0.0f;
+    LeftForget(loco);                                       // its wagons are back
+    // It was heading for a waypoint beyond the wagons; turned round with them
+    // it goes back the way it came: that waypoint is done, on to the next stop.
+    BYTE *swp = 0;
+    int sord = 0, sat = -1;
+    void* skey = TrainStop(loco, &swp, &sord, &sat);
+    BYTE *sb = 0, *se = 0;
+    Rd(loco, 0x680, &sb); Rd(loco, 0x688, &se);
+    int nstops = sb && se > sb ? (int)((se - sb) / 8) : 0;
+    if (skey && swp && nstops > 0) {
+        *(int*)(loco + 0x698) = (sat + 1) % nstops;
+        *(short*)(loco + 0xD3A) = 1;                        // plan the way again, as the game does on passing a waypoint
+        Logf("railreverse  [couple] %p: stop %d (the waypoint beyond the wagons) done, on to stop %d", loco, sat + 1,
+             (sat + 1) % nstops + 1);
+    }
+    Logf("railreverse  [couple] %p: coupled %d cars at the %s end (touch at %.1f, front end %.1f m off, back end "
+         "%.1f m off); locomotive on %p at %.1f, trail of %d over %d segments of the wagons (%.1f m)",
+         loco, ln, front ? "front" : "back (ran round)", hitAt, toFront, toRear, lseg, lpos, r, count, len);
+    return true;
+}
+
+static void MarkedStop(BYTE* lead, const float* at3);
+
 static void HookXform(BYTE* v, float* pos, float yaw, float pitch)
 {
     if (g_pendingLive) RestorePending();
+    if (g_marksPending) ResolveMarks();
+    if (cfg.shunting && g_standScan) StandScan();
+    if (g_standCount) StandCheck();
+    if (v && cfg.shunting && !*(BYTE**)(v + V_PARENT)) MarkedStop(v, pos);
+    if (v && g_leftCount && !*(BYTE**)(v + V_PARENT)) LeftRun(v);
+    if (v && v == g_turned && cfg.research) {
+        if ((int)(GetTickCount() - g_turnedUntil) > 0) g_turned = 0;
+        else RoundLog(v);
+    }
+    if (v && cfg.shunting && !*(BYTE**)(v + V_PARENT)) Approach(v);
+    if (cfg.shunting) WatchCars();
     if (v && g_trainCount) {
         BYTE* lead = *(BYTE**)(v + V_PARENT);
+        if (!lead && cfg.research) RouteDebug(v);
         if (!lead) {
             if (LeadXform(v, pos, yaw, pitch)) return;
         } else if (g_anyPushing && IsPushing(lead)) {
@@ -1248,184 +2240,14 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned, int limit
     for (int i = 0; i < 4; ++i) Text(x, y + i * lineH, colors[i], lines[i]);
 }
 
-// ---------------------------------------------------------------- train window buttons
-// Two buttons below the game's signal button, drawn and clicked the way the
-// game does its own (same panel, so they are clipped and scrolled with the
-// window): reversing for this train (as key_train) and the most wagons a
-// supply base hands it (left click +1, right click -1, round in a ring like
-// the keys). The icons sit next to the dll.
-#define RVA_INPUT      0xA54B90   // C3D_INPUT
-#define RVA_CLICK      0xA54E91   // u8: a left click this frame, cleared by whoever takes it
-#define RVA_RCLICK     0xA54E93   // u8: a right click (0xA54E90/91 left down/click, 92/93 right)
-#define RVA_PANEL      0x9BE060   // the C3D_PANEL2D the windows draw their buttons with
-#define RVA_PANEL_SIZE 0x9BE2E8   // float w, h
-#define RVA_PANEL_POS  0x9BE2F0   // float x, y; then a dword 0
-#define RVA_PANEL_RGBA 0x9BE30C   // float r, g, b, a
-#define RVA_SAMPLER    0x9EAD08   // what a texture is bound with
-#define RVA_MIDDLE     0x9EACD0   // C3D_MIDDLEPOINT: makes textures
-#define UI_TOOLTIP     0xD5A0     // ui: wchar_t tooltip of what is under the mouse
-#define W_ACTIVE       0x20       // u8: the window takes the mouse
-#define EXP_MOUSE      "?GetMouseSolid@C3D_INPUT@@QEAA?AVC3DVECTOR3@@XZ"
-#define EXP_TEXTURE    "?CreateManagedTexture@C3D_MIDDLEPOINT@@QEAAPEAVC3DAPI_TEXTURE@@PEBD@Z"
-#define EXP_DRAW       "?Draw@C3D_PANEL2D@@QEAAXMMMMM_N@Z"
-typedef float* (*FnMouse)(void* input, float* out);
-typedef void* (*FnTexture)(void* middle, const char* name);
-typedef int (*FnLoad)(void* tex, const char* path, int w, int h, unsigned mips, int format);
-typedef void (*FnBind)(void* tex, int slot, void* sampler);
-typedef void (*FnDraw)(void* panel, float u0, float v0, float u1, float v1, float rot, bool blend);
-static FnMouse   g_mouse;
-static FnTexture g_texture;
-static FnDraw    g_panelDraw;
-#define ICONS 4
-static void*     g_icons[ICONS];   // push off, on; limit off, on
-#define ICON_PUSH  0
-#define ICON_LIMIT 2
-
-// Loaded the way the game loads its buttons, by a path relative to media_soviet.
-static bool LoadIcons(void)
-{
-    static int tried;
-    if (InterlockedExchange(&g_iconsStale, 0)) {
-        tried = 0;
-        for (int i = 0; i < ICONS; ++i) g_icons[i] = 0;
-    }
-    if (tried++) {
-        for (int i = 0; i < ICONS; ++i) if (!g_icons[i]) return false;
-        return true;
-    }
-    char dir[MAX_PATH] = "";
-    HMODULE self = 0;
-    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCSTR)&LoadIcons, &self);
-    DWORD n = GetModuleFileNameA(self, dir, MAX_PATH);
-    while (n && dir[n - 1] != '\\' && dir[n - 1] != '/') --n;
-    dir[n] = 0;
-    const char* names[ICONS] = { "button_push_off.png", "button_push_on.png", "button_limit_off.png", "button_limit_on.png" };
-    for (int i = 0; i < ICONS; ++i) {
-        char path[MAX_PATH], full[MAX_PATH], media[MAX_PATH];
-        _snprintf_s(full, sizeof(full), _TRUNCATE, "%s%s", dir, names[i]);
-        DWORD m = GetModuleFileNameA(0, media, MAX_PATH);
-        while (m && media[m - 1] != '\\') --m;
-        _snprintf_s(media + m, sizeof(media) - m, _TRUNCATE, "media_soviet");
-        if (!PathRelativePathToA(path, media, FILE_ATTRIBUTE_DIRECTORY, full, 0)) strcpy(path, full);
-        for (char* c = path; *c; ++c) if (*c == '\\') *c = '/';
-        if (path[0] == '.' && path[1] == '/') memmove(path, path + 2, strlen(path + 2) + 1);
-        void* tex = g_texture(g_exeBase + RVA_MIDDLE, path);
-        int err = tex ? ((FnLoad)(*(void***)tex)[2])(tex, path, 0, 0, 1, 0) : -1;   // 0: loaded (the game checks != 0)
-        if (err) Logf("railreverse  icon %s not loaded (%d)", path, err);
-        g_icons[i] = err ? 0 : tex;
-    }
-    for (int i = 0; i < ICONS; ++i) if (!g_icons[i]) return false;
-    return true;
-}
-
-static void DrawIcon(void* tex, float x, float y, float size, float alpha)
-{
-    ((FnBind)(*(void***)tex)[0x70 / 8])(tex, 0, *(void**)(g_exeBase + RVA_SAMPLER));
-    float* sz = (float*)(g_exeBase + RVA_PANEL_SIZE);
-    float* at = (float*)(g_exeBase + RVA_PANEL_POS);
-    float* rgba = (float*)(g_exeBase + RVA_PANEL_RGBA);
-    sz[0] = sz[1] = size;
-    at[0] = x; at[1] = y; *(int*)(at + 2) = 0;
-    rgba[0] = rgba[1] = rgba[2] = 1.0f;
-    rgba[3] = alpha;
-    g_panelDraw(g_exeBase + RVA_PANEL, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, true);
-}
-
-static bool Hover(BYTE* window, float x, float y, float size)
-{
-    float m[3] = { 0, 0, 0 };
-    g_mouse(g_exeBase + RVA_INPUT, m);
-    return *(window + W_ACTIVE) && fabsf(m[0] - x) <= size / 2 && fabsf(m[1] - y) <= size / 2;
-}
-
-static void Tooltip(BYTE* ui, const wchar_t* tip)
-{
-    wcsncpy((wchar_t*)(ui + UI_TOOLTIP), tip, 160);
-    ((wchar_t*)(ui + UI_TOOLTIP))[159] = 0;
-}
+static void WindowButtons(BYTE* ui, BYTE* window, BYTE* lead);
 
 // The wagon limit one step up or down, round in a ring: no limit -> 1 -> ...
-// -> hub_limit_max -> no limit (keys and the button alike).
+// -> hub_limit_max -> no limit (keys and the train window button alike).
 static int StepLimit(int limit, int step)
 {
     if (step > 0) return limit >= cfg.hubLimitMax ? 0 : limit + 1;
     return limit <= 0 ? cfg.hubLimitMax : limit - 1;
-}
-
-static void WindowButtons(BYTE* ui, BYTE* window, BYTE* lead)
-{
-    if (!LoadIcons()) return;
-    ReloadIndicatorSettings();
-    float sc = 1.0f, wx = 0, wy = 0, ox = 0, oy = 0;
-    Rd(g_exeBase, RVA_UI_SCALE, &sc);
-    if (!(sc > 0.25f && sc < 8.0f)) sc = 1.0f;
-    if (!Rd(window, W_POS_X, &wx) || !Rd(window, W_POS_Y, &wy) || !Rd(window, W_OFF_X, &ox) || !Rd(window, W_OFF_Y, &oy)) return;
-    float size = sc * 50.0f, x = wx + ox + sc * cfg.buttonX, y1 = wy + oy + sc * cfg.buttonY, y2 = y1 + sc * 52.0f;
-    bool ru = T == &kRussian;
-
-    EnterCriticalSection(&g_lock);
-    Train* t = Current(lead, false);
-    int chosen = t ? t->chosen : 0, limit = t ? t->hubLimit : 0;
-    LeaveCriticalSection(&g_lock);
-
-    // green while this train reverses: its own switch, or all trains of its class (Scripts menu)
-    bool passenger = IsPassengerTrain(lead);
-    bool classOn = passenger ? g_allPassenger != 0 : g_allFreight != 0;
-    bool h1 = Hover(window, x, y1, size), h2 = Hover(window, x, y2, size);
-    DrawIcon(g_icons[ICON_PUSH + (chosen || classOn ? 1 : 0)], x, y1, size, h1 ? 1.0f : 0.8f);
-    DrawIcon(g_icons[ICON_LIMIT + (limit ? 1 : 0)], x, y2, size, h2 ? 1.0f : 0.8f);
-    if (limit && g_font) {
-        wchar_t n[8];
-        _snwprintf_s(n, 8, _TRUNCATE, L"%d", limit);
-        float tw = (float)wcslen(n) * g_fontPx * 0.55f;
-        Text(x - tw / 2, y2 - size * 0.42f, 0xFF289628u, n);
-    }
-    if (!h1 && !h2) return;
-
-    BYTE* click = g_exeBase + RVA_CLICK;
-    BYTE* rclick = g_exeBase + RVA_RCLICK;
-    wchar_t tip[160];
-    if (h1) {
-        wchar_t kTrain[40];
-        KeyText(&cfg.keyTrain, kTrain, 40);
-        _snwprintf_s(tip, 160, _TRUNCATE,
-                     ru ? L"Реверс выбранного поезда: %ls\r\nЛокомотив толкает вагоны задним ходом.\r\nНажмите, чтобы %ls (%ls)\r\nВсе %ls: %ls (меню Скрипты)"
-                        : L"Reversing for the selected train: %ls\r\nThe locomotive pushes its wagons backwards.\r\nClick to switch %ls (%ls)\r\nAll %ls trains: %ls (Scripts menu)",
-                     chosen ? (ru ? L"ВКЛ." : L"ON") : (ru ? L"выкл." : L"off"),
-                     chosen ? (ru ? L"выключить" : L"off") : (ru ? L"включить" : L"on"), kTrain,
-                     passenger ? (ru ? L"пассажирские" : L"passenger") : (ru ? L"грузовые" : L"freight"),
-                     classOn ? (ru ? L"вкл." : L"on") : (ru ? L"выкл." : L"off"));
-        Tooltip(ui, tip);
-        if (*click) {
-            *click = 0;                                    // taken: nothing under the window gets it
-            EnterCriticalSection(&g_lock);
-            if (Train* c = Current(lead, true)) chosen = c->chosen = !c->chosen;
-            LeaveCriticalSection(&g_lock);
-            Logf("railreverse  train %p: reversing %s (button)", lead, chosen ? "ON" : "off");
-        }
-        return;
-    }
-    wchar_t now[40], kReset[40];
-    KeyText(&cfg.keyLimitReset, kReset, 40);
-    if (limit) _snwprintf_s(now, 40, _TRUNCATE, ru ? L"не больше %d" : L"at most %d", limit);
-    else wcscpy(now, ru ? L"без ограничения" : L"no limit");
-    _snwprintf_s(tip, 160, _TRUNCATE,
-                 ru ? L"Вагоны с базы снабжения: %ls\r\nЛевый клик +1, правый -1\r\nСброс на «без ограничения»: %ls"
-                    : L"Wagons from a supply base: %ls\r\nLeft click +1, right click -1\r\nBack to no limit: %ls",
-                 now, kReset);
-    Tooltip(ui, tip);
-    int step = *click ? 1 : *rclick ? -1 : 0;
-    if (!step) return;
-    *click = 0;
-    *rclick = 0;
-    EnterCriticalSection(&g_lock);
-    if (Train* c = Current(lead, true)) {
-        c->hubLimit = StepLimit(c->hubLimit, step);
-        limit = c->hubLimit;
-    }
-    LeaveCriticalSection(&g_lock);
-    Logf("railreverse  train %p: hub limit %d%s (button)", lead, limit, limit ? " wagons" : " (none)");
 }
 
 static void TrainWindow(BYTE* ui, BYTE* window, FnPanel orig)
@@ -1486,7 +2308,6 @@ static void HookPanel(BYTE* ui, BYTE* window)  { TrainWindow(ui, window, g_origP
 // flag runs. Running scripts are kept in the save (runningScripts.bin,
 // FUN_14059a4a0): world +0x13BB8, a vector of script*, each with two wide
 // strings at *(+0xB8) and *(+0xC0) (its file and name, FUN_140598890).
-#define RVA_WORLD        0x9D4F10
 #define WORLD_SCRIPTS    0x13BB8
 #define FLAG_FREIGHT     L"RR_AllFreightOn"
 #define FLAG_PASSENGER   L"RR_AllPassengerOn"
@@ -1508,6 +2329,7 @@ static bool ScriptNamed(BYTE* script, const wchar_t* name)
 
 static void ScriptFlags(void)
 {
+    if (!g_build119) return;
     static DWORD last;
     static int freightWas = -1, passengerWas = -1;      // -1: not logged since the load
     DWORD now = GetTickCount();
@@ -1532,6 +2354,838 @@ static void ScriptFlags(void)
     if (passenger != passengerWas) Logf("railreverse  all passenger trains: %s (Scripts menu)", passenger ? "ON" : "off");
     freightWas = freight;
     passengerWas = passenger;
+}
+
+// ---------------------------------------------------------------- route window buttons (ini shunting)
+// Research for shunting: a "uncouple here" switch for a stop of a route. The
+// route window (kind 8) is drawn by FUN_1407cff50, called from the window
+// dispatcher at one site; that call is redirected here. Window fields (seen in
+// FUN_1407cff50): +0x264 the selected stop, +0x270 the route being shown;
+// route +0x210 stops (vector of building*, 0 for a waypoint), +0x228 a record
+// per stop (0x198 bytes, +0x190 the waypoint for a stop without a building).
+// 1.1.1.9 addresses (off on another build).
+static const short SIG_ROUTE_CALL[] = {   // cmp ecx,8; jne; mov rdx,rsi; mov rcx,rdi; call FUN_1407cff50; jmp
+    0x83,0xf9,0x08, 0x75,0x10, 0x48,0x8b,0xd6, 0x48,0x8b,0xcf, 0xe8,-1,-1,-1,-1, 0xe9,-1,-1,-1,-1, 0x83,0xf9,0x0a, 0x75,
+};
+#define ROUTE_CALL_AT  11
+#define RW_SELECTED    0x264
+#define RW_ROUTE       0x270
+#define R_STOPS        0x210
+#define R_STOPS_END    0x218
+#define R_RECORDS      0x228
+#define REC_SIZE       0x198
+#define REC_WAYPOINT   0x190
+#define RVA_INPUT      0xA54B90   // C3D_INPUT, as FUN_1407cff50 uses it
+#define RVA_CLICK      0xA54E91   // u8: a left click this frame, cleared by whoever takes it
+#define RVA_PANEL      0x9BE060   // the C3D_PANEL2D the windows draw their buttons with
+#define RVA_PANEL_SIZE 0x9BE2E8   // float w, h
+#define RVA_PANEL_POS  0x9BE2F0   // float x, y; then a dword 0
+#define RVA_PANEL_RGBA 0x9BE30C   // float r, g, b, a
+#define RVA_SAMPLER    0x9EAD08   // what a texture is bound with
+#define RVA_MIDDLE     0x9EACD0   // C3D_MIDDLEPOINT: makes textures
+#define UI_TOOLTIP     0xD5A0     // ui: wchar_t tooltip of what is under the mouse
+#define W_ACTIVE       0x20       // u8: the window takes the mouse
+#define EXP_MOUSE      "?GetMouseSolid@C3D_INPUT@@QEAA?AVC3DVECTOR3@@XZ"
+#define EXP_TEXTURE    "?CreateManagedTexture@C3D_MIDDLEPOINT@@QEAAPEAVC3DAPI_TEXTURE@@PEBD@Z"
+#define EXP_DRAW       "?Draw@C3D_PANEL2D@@QEAAXMMMMM_N@Z"
+typedef void (*FnRouteWindow)(BYTE* ui, BYTE* window);
+typedef float* (*FnMouse)(void* input, float* out);
+typedef void* (*FnTexture)(void* middle, const char* name);
+typedef int (*FnLoad)(void* tex, const char* path, int w, int h, unsigned mips, int format);
+typedef void (*FnBind)(void* tex, int slot, void* sampler);
+typedef void (*FnDraw)(void* panel, float u0, float v0, float u1, float v1, float rot, bool blend);
+static FnRouteWindow g_origRoute;
+static FnMouse   g_mouse;
+static FnTexture g_texture;
+static FnDraw    g_panelDraw;
+#define ICONS 8
+static void*     g_icons[ICONS];   // uncouple off, on; reverse off, on; push off, on; limit off, on
+#define ICON_PUSH  4
+#define ICON_LIMIT 6
+// Stops marked "uncouple" or "stop and turn round" (kind). A waypoint by where it is: the route window shows
+// a copy of the route, its waypoints are not the trains' ones. A route may go
+// by the same waypoint (or building) more than once: the mark is for one
+// visit, ord, counted from 0 in the order of the stops (-1: any, a mark from
+// before visits were told apart). A mark is for one route: the route window
+// shows it at +0x240, a train's lead has its route at +0x650; a route has its
+// name at +0xC and its vehicles at +0x240 (FUN_1404945a0). In the sidecar the
+// route is one of its vehicles' index and its name; a mark without a route
+// (from before routes were told apart) is for every route.
+#define ANY_VISIT -2
+#define MARK_UNCOUPLE 0
+#define MARK_REVERSE  1
+#define W_ROUTE       0x240       // route window: the route itself (+0x270 is the copy being edited)
+#define V_ROUTE       0x650       // lead: its route
+#define ROUTE_NAME    0x0C        // route: wchar_t name
+#define ROUTE_VEHICLES 0x240      // route: vector of vehicle*
+#define ROUTE_NAME_MAX 64
+struct Mark {
+    void* building; float at[3]; int ord; int kind;
+    BYTE* route;                  // 0: not known yet (see veh, name) or any route
+    int veh;                      // from the sidecar: index of a vehicle on the route, -1 none
+    wchar_t name[ROUTE_NAME_MAX]; // the route's name, "" for a mark of any route
+};
+static Mark g_marks[64];
+static int  g_markCount;
+
+static BYTE* RouteOf(BYTE* lead)
+{
+    BYTE* r = 0;
+    return lead && Rd(lead, V_ROUTE, &r) ? r : 0;
+}
+
+static void RouteName(BYTE* route, wchar_t* out)
+{
+    out[0] = 0;
+    if (!route) return;
+    int n = 0;
+    const wchar_t* p = (const wchar_t*)(route + ROUTE_NAME);
+    while (n + 1 < ROUTE_NAME_MAX && ReadablePtr(p + n, 2) && p[n]) out[n] = p[n], ++n;
+    out[n] = 0;
+}
+
+// Its route for a mark from the sidecar: by the vehicle, else by the name.
+static void ResolveMarks(void)
+{
+    if (!g_marksPending) return;
+    BYTE** veh = 0;
+    int n = VehicleCount(&veh), open = 0;
+    if (n <= 0) return;
+    for (int i = 0; i < g_markCount; ++i) {
+        Mark& m = g_marks[i];
+        if (m.route || !m.name[0]) continue;
+        if (m.veh >= 0 && m.veh < n && veh[m.veh]) m.route = RouteOf(veh[m.veh]);
+        for (int k = 0; k < n && !m.route; ++k) {
+            BYTE* r = veh[k] ? RouteOf(veh[k]) : 0;
+            wchar_t name[ROUTE_NAME_MAX];
+            RouteName(r, name);
+            if (r && !wcscmp(name, m.name)) m.route = r;
+        }
+        if (!m.route) ++open;
+    }
+    g_marksPending = 0;
+    if (open) Logf("railreverse  %d stop mark(s) whose route has no train now: matched by name later", open);
+}
+
+static void MarkOf(void* key, BYTE* wp, int ord, Mark* m)
+{
+    m->route = 0;
+    m->veh = -1;
+    m->name[0] = 0;
+    m->building = wp ? 0 : key;
+    m->at[0] = m->at[1] = m->at[2] = 0.0f;
+    if (wp) { Rd(wp, 4, &m->at[0]); Rd(wp, 8, &m->at[1]); Rd(wp, 12, &m->at[2]); }
+    m->ord = ord;
+    m->kind = MARK_UNCOUPLE;
+}
+
+static bool SamePlace(const Mark& a, const Mark& b)
+{
+    return a.building ? a.building == b.building
+                      : !b.building && fabsf(a.at[0] - b.at[0]) < 0.5f && fabsf(a.at[1] - b.at[1]) < 0.5f &&
+                        fabsf(a.at[2] - b.at[2]) < 0.5f;
+}
+
+// Stop idx of a list of stops (building* each, 0 for a waypoint) with their
+// records: its key, its waypoint, and which visit of that place it is.
+static void* StopKey(BYTE** stops, BYTE* recs, int n, int idx, BYTE** wp, int* ord)
+{
+    *wp = 0; *ord = 0;
+    if (!stops || idx < 0 || idx >= n || !ReadablePtr(stops, (size_t)n * 8)) return 0;
+    BYTE* key = stops[idx];
+    if (!key && recs) Rd(recs + (size_t)idx * REC_SIZE, REC_WAYPOINT, wp);
+    if (!key) key = *wp;
+    if (!key) return 0;
+    Mark self, other;
+    MarkOf(key, *wp, 0, &self);
+    for (int j = 0; j < idx; ++j) {
+        BYTE *ow = 0, *ok = stops[j];
+        if (!ok && recs) Rd(recs + (size_t)j * REC_SIZE, REC_WAYPOINT, &ow);
+        if (!ok) ok = ow;
+        if (!ok) continue;
+        MarkOf(ok, ow, 0, &other);
+        if (SamePlace(self, other)) ++*ord;
+    }
+    return key;
+}
+
+// The current stop of a train: its key, waypoint and visit.
+static void* TrainStop(BYTE* lead, BYTE** wp, int* ord, int* at)
+{
+    BYTE *sb = 0, *se = 0, *recs = 0;
+    *at = -1;
+    Rd(lead, 0x680, &sb); Rd(lead, 0x688, &se); Rd(lead, 0x638, &recs); Rd(lead, 0x698, at);
+    int n = sb && se > sb ? (int)((se - sb) / 8) : 0;
+    return StopKey((BYTE**)sb, recs, n, *at, wp, ord);
+}
+
+// In the save's sidecar, one line per waypoint:
+// "uncouple|reverse <x> <y> <z> <visit> <vehicle> <route name>" (vehicle: the
+// index of one on the route, -1 none; the name in UTF-8). A building is known
+// by its address only, which a load changes: not kept.
+static int MarksText(char* out, int cap, int* count)
+{
+    int len = 0;
+    *count = 0;
+    BYTE** veh = 0;
+    int nv = VehicleCount(&veh);
+    for (int i = 0; i < g_markCount && len >= 0 && len < cap; ++i) {
+        const Mark& m = g_marks[i];
+        if (m.building) continue;
+        int vi = -1;
+        for (int k = 0; k < nv && m.route && vi < 0; ++k)
+            if (veh[k] && !*(BYTE**)(veh[k] + V_PARENT) && RouteOf(veh[k]) == m.route) vi = k;   // a lead
+        if (vi < 0) vi = m.veh;                            // not resolved since the load: as it was
+        char name[ROUTE_NAME_MAX * 3] = "";
+        WideCharToMultiByte(CP_UTF8, 0, m.name, -1, name, sizeof(name), 0, 0);
+        len += _snprintf_s(out + len, cap - len, _TRUNCATE, "%s %.3f %.3f %.3f %d %d %s\n",
+                           m.kind == MARK_REVERSE ? "reverse" : "uncouple", m.at[0], m.at[1], m.at[2], m.ord, vi, name);
+        ++*count;
+    }
+    return len > 0 ? len : 0;
+}
+
+static void LoadMark(const char* text, int kind)
+{
+    Mark m = {};
+    m.kind = kind;
+    m.ord = -1;                                            // a line from before visits were told apart: any
+    m.veh = -1;
+    int used = 0;
+    int got = sscanf(text, "%f %f %f %d %d %n", &m.at[0], &m.at[1], &m.at[2], &m.ord, &m.veh, &used);
+    if (g_markCount >= 64 || got < 3) return;
+    if (got >= 5 && used > 0 && text[used])                // a route: from 0.6.0 on
+        MultiByteToWideChar(CP_UTF8, 0, text + used, -1, m.name, ROUTE_NAME_MAX - 1);
+    m.name[ROUTE_NAME_MAX - 1] = 0;
+    if (m.name[0]) g_marksPending = 1;
+    g_marks[g_markCount++] = m;
+}
+
+static void ClearMarks(void) { g_markCount = 0; g_marksPending = 0; }
+
+// A mark of this route; ord ANY_VISIT: on any visit of that place.
+static bool SameRoute(Mark& g, BYTE* route)
+{
+    if (g.route) return g.route == route;
+    if (!g.name[0]) return true;                           // from before routes were told apart: any
+    wchar_t name[ROUTE_NAME_MAX];                          // its route has had no train since the load
+    RouteName(route, name);
+    if (!route || wcscmp(name, g.name)) return false;
+    g.route = route;
+    return true;
+}
+
+static int MarkIndex(BYTE* route, void* key, BYTE* wp, int ord, int kind = MARK_UNCOUPLE)
+{
+    Mark m;
+    MarkOf(key, wp, ord, &m);
+    for (int i = 0; i < g_markCount; ++i) {
+        Mark& g = g_marks[i];
+        if (g.kind == kind && SamePlace(m, g) && (ord == ANY_VISIT || g.ord < 0 || g.ord == ord) && SameRoute(g, route))
+            return i;
+    }
+    return -1;
+}
+
+// Stop idx of the shown route: its key (building or waypoint), or 0.
+static void* StopAt(BYTE* window, int idx, int* count, BYTE** route, BYTE** wp, int* ord)
+{
+    *count = 0; *route = 0; *wp = 0; *ord = 0;
+    BYTE *b = 0, *e = 0, *recs = 0;
+    if (!Rd(window, RW_ROUTE, route) || !*route) return 0;
+    if (!Rd(*route, R_STOPS, &b) || !Rd(*route, R_STOPS_END, &e) || e < b) return 0;
+    *count = (int)((e - b) / 8);
+    Rd(*route, R_RECORDS, &recs);
+    return StopKey((BYTE**)b, recs, *count, idx, wp, ord);
+}
+
+// The selected stop of the shown route.
+static void* SelectedStop(BYTE* window, int* idx, int* count, BYTE** route, BYTE** wp, int* ord)
+{
+    *idx = -1;
+    Rd(window, RW_SELECTED, idx);
+    return StopAt(window, *idx, count, route, wp, ord);
+}
+
+// The stop list's rows: FUN_1407cff50 draws each with
+// C3D_PANEL2D::DrawFrom9Patch, one call per stop in order (the call at
+// +7D2616). That import is hooked: right after the row of a marked stop, a
+// small icon at its right end, drawn by the same panel (scrolled and clipped
+// with the row).
+#define EXP_9PATCH   "?DrawFrom9Patch@C3D_PANEL2D@@QEAAXUC3DRECT@@MMMMMM@Z"
+#define RVA_ROW_DRAW 0x7D261C         // the return address of the stop rows' call
+typedef void (*Fn9Patch)(void* panel, int* rect, float a, float b, float c, float d, float e, float f);
+static Fn9Patch g_orig9Patch;
+static BYTE* g_rowWindow;             // the route window being drawn, its next row
+static int   g_rowIdx;
+static void  RowIcon(BYTE* window, int idx, const int* rect);
+
+static void Hook9Patch(void* panel, int* rect, float a, float b, float c, float d, float e, float f)
+{
+    g_orig9Patch(panel, rect, a, b, c, d, e, f);
+    if (g_rowWindow && rect && (BYTE*)__builtin_return_address(0) == g_exeBase + RVA_ROW_DRAW)
+        RowIcon(g_rowWindow, g_rowIdx++, rect);
+}
+
+// The icons sit next to this plugin's dll; loaded the way the game loads its buttons.
+static bool LoadIcons(void)
+{
+    static int tried;
+    if (InterlockedExchange(&g_iconsStale, 0)) {
+        tried = 0;
+        for (int i = 0; i < ICONS; ++i) g_icons[i] = 0;
+    }
+    if (tried++) {
+        for (int i = 0; i < ICONS; ++i) if (!g_icons[i]) return false;
+        return true;
+    }
+    char dir[MAX_PATH] = "";
+    HMODULE self = 0;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&LoadIcons, &self);
+    DWORD n = GetModuleFileNameA(self, dir, MAX_PATH);
+    while (n && dir[n - 1] != '\\' && dir[n - 1] != '/') --n;
+    dir[n] = 0;
+    const char* names[ICONS] = { "button_uncouple_off.png", "button_uncouple_on.png", "button_reverse_off.png",
+                                 "button_reverse_on.png", "button_push_off.png", "button_push_on.png",
+                                 "button_limit_off.png", "button_limit_on.png" };
+    for (int i = 0; i < ICONS; ++i) {
+        char path[MAX_PATH];
+        // the game opens textures relative to its media folder ("editor/button_cancel.png")
+        char full[MAX_PATH], media[MAX_PATH];
+        _snprintf_s(full, sizeof(full), _TRUNCATE, "%s%s", dir, names[i]);
+        DWORD m = GetModuleFileNameA(0, media, MAX_PATH);
+        while (m && media[m - 1] != '\\') --m;
+        _snprintf_s(media + m, sizeof(media) - m, _TRUNCATE, "media_soviet");
+        if (!PathRelativePathToA(path, media, FILE_ATTRIBUTE_DIRECTORY, full, 0)) strcpy(path, full);
+        for (char* c = path; *c; ++c) if (*c == '\\') *c = '/';
+        if (path[0] == '.' && path[1] == '/') memmove(path, path + 2, strlen(path + 2) + 1);
+        void* tex = g_texture(g_exeBase + RVA_MIDDLE, path);
+        int err = tex ? ((FnLoad)(*(void***)tex)[2])(tex, path, 0, 0, 1, 0) : -1;   // 0: loaded (the game checks != 0)
+        if (err) Logf("railreverse  icon %s not loaded (%d)", path, err);
+        g_icons[i] = err ? 0 : tex;
+    }
+    for (int i = 0; i < ICONS; ++i) if (!g_icons[i]) return false;
+    return true;
+}
+
+static void DrawIcon(void* tex, float x, float y, float size, float alpha)
+{
+    ((FnBind)(*(void***)tex)[0x70 / 8])(tex, 0, *(void**)(g_exeBase + RVA_SAMPLER));
+    float* sz = (float*)(g_exeBase + RVA_PANEL_SIZE);
+    float* at = (float*)(g_exeBase + RVA_PANEL_POS);
+    float* rgba = (float*)(g_exeBase + RVA_PANEL_RGBA);
+    sz[0] = sz[1] = size;
+    at[0] = x; at[1] = y; *(int*)(at + 2) = 0;
+    rgba[0] = rgba[1] = rgba[2] = 1.0f;
+    rgba[3] = alpha;
+    g_panelDraw(g_exeBase + RVA_PANEL, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, true);
+}
+
+static void RowIcon(BYTE* window, int idx, const int* rect)
+{
+    int count;
+    BYTE *route, *wp;
+    int ord;
+    void* key = StopAt(window, idx, &count, &route, &wp, &ord);
+    if (!key || !LoadIcons()) return;
+    float sc = 1.0f;
+    Rd(g_exeBase, RVA_UI_SCALE, &sc);
+    float size = sc * 30.0f, x = (float)rect[2] - sc * 60.0f;
+    for (int kind = MARK_UNCOUPLE; kind <= MARK_REVERSE; ++kind) {
+        if (MarkIndex(*(BYTE**)(window + W_ROUTE), key, wp, ord, kind) < 0) continue;
+        DrawIcon(g_icons[kind * 2 + 1], x, (rect[1] + rect[3]) * 0.5f, size, 1.0f);
+        x -= sc * 36.0f;
+    }
+}
+
+// After the game drew the route window: two more buttons at the end of its
+// row, drawn and clicked the way the game does its own (same panel, so they
+// are clipped and scrolled with them). They act on the selected stop, a
+// waypoint or a signal only (a station stops the train anyway).
+static void RouteButton(BYTE* ui, BYTE* window, int kind)
+{
+    if (!LoadIcons()) return;
+    float sc = 1.0f, wx = 0, wy = 0, ox = 0, oy = 0;
+    Rd(g_exeBase, RVA_UI_SCALE, &sc);
+    if (!Rd(window, W_POS_X, &wx) || !Rd(window, W_POS_Y, &wy) || !Rd(window, W_OFF_X, &ox) || !Rd(window, W_OFF_Y, &oy)) return;
+    // the game's buttons: x0 + 20 * scale, 52 * scale apart, 50 * scale square, at y0 + 25 * scale.
+    // "Delete all stops" comes third when the route (+1) and its copy have
+    // stops (FUN_1407cff50); the buttons after it move one place on.
+    BYTE *real = 0, *copy = 0, *cb = 0, *ce = 0;
+    Rd(window, W_ROUTE, &real); Rd(window, RW_ROUTE, &copy);
+    bool extra = real && real[1] && copy && Rd(copy, R_STOPS, &cb) && Rd(copy, R_STOPS_END, &ce) && ce > cb;
+    float size = sc * 50.0f, x = wx + ox + sc * (20.0f + (6 + kind + (extra ? 1 : 0)) * 52.0f), y = wy + oy + sc * 25.0f;
+
+    int idx, count;
+    BYTE *route, *wp;
+    int ord;
+    void* key = SelectedStop(window, &idx, &count, &route, &wp, &ord);
+    if (!wp) key = 0;                                      // a station: nothing to do here
+    bool marked = key && MarkIndex(real, key, wp, ord, kind) >= 0;
+
+    float m[3] = { 0, 0, 0 };
+    g_mouse(g_exeBase + RVA_INPUT, m);
+    // the panel's position is the button's centre
+    bool hover = *(window + W_ACTIVE) && fabsf(m[0] - x) <= size / 2 && fabsf(m[1] - y) <= size / 2;
+
+    DrawIcon(g_icons[kind * 2 + marked], x, y, size, !key ? 0.25f : hover ? 1.0f : 0.8f);   // the game's: dim when it can't act, bright under the mouse
+
+    static BYTE* lastWindow;
+    if (cfg.research && kind == MARK_UNCOUPLE && window != lastWindow) {
+        lastWindow = window;
+        Logf("railreverse  [route] window %p: route %p, %d stops, selected %d; at %.0f,%.0f + %.0f,%.0f, scale %.2f, "
+             "button at %.0f,%.0f", window, route, count, idx, wx, wy, ox, oy, sc, x, y);
+    }
+    if (!hover) return;
+    static const wchar_t* tips[2][2][3] = {
+        { { L"Расцепка: выберите пункт маршрута или светофор",
+            L"Расцепка в этом пункте: выкл.\r\nЛокомотив оставит здесь вагоны, объедет их\r\nпо следующим пунктам и прицепится с другой стороны.\r\nНажмите, чтобы включить",
+            L"Расцепка в этом пункте: ВКЛ.\r\nНажмите, чтобы выключить" },
+          { L"Стоп и разворот: выберите пункт маршрута или светофор",
+            L"Стоп и разворот в этом пункте: выкл.\r\nПоезд встанет здесь и поедет дальше,\r\nразвернувшись, если нужно. Нажмите, чтобы включить",
+            L"Стоп и разворот в этом пункте: ВКЛ.\r\nНажмите, чтобы выключить" } },
+        { { L"Uncouple: select a waypoint or a signal",
+            L"Uncouple here: off\r\nThe locomotive leaves its wagons here, runs round\r\nthem by the next stops and couples at the other end.\r\nClick to switch on",
+            L"Uncouple here: ON\r\nClick to switch off" },
+          { L"Stop and turn round: select a waypoint or a signal",
+            L"Stop and turn round here: off\r\nThe train stops here and goes on,\r\nturned round if need be. Click to switch on",
+            L"Stop and turn round here: ON\r\nClick to switch off" } },
+    };
+    wcsncpy((wchar_t*)(ui + UI_TOOLTIP), tips[T == &kRussian ? 0 : 1][kind][!key ? 0 : marked ? 2 : 1], 160);
+    ((wchar_t*)(ui + UI_TOOLTIP))[159] = 0;
+
+    BYTE* click = g_exeBase + RVA_CLICK;
+    if (!*click || !key) return;
+    *click = 0;                                            // taken: nothing under the window gets it
+    int i = MarkIndex(real, key, wp, ord, kind);
+    if (i >= 0) g_marks[i] = g_marks[--g_markCount];      // an old mark on every visit goes as a whole
+    else if (g_markCount < 64) {
+        MarkOf(key, wp, ord, &g_marks[g_markCount]);
+        g_marks[g_markCount].route = real;
+        RouteName(real, g_marks[g_markCount].name);
+        g_marks[g_markCount++].kind = kind;
+    }
+    float pos[3] = { 0, 0, 0 };
+    if (wp) { Rd(wp, 4, &pos[0]); Rd(wp, 8, &pos[1]); Rd(wp, 12, &pos[2]); }
+    Logf("railreverse  [route] route %p stop %d of %d (%s %p, at %.1f %.1f %.1f, visit %d): %s %s", route, idx + 1,
+         count, wp ? "waypoint" : "building", key, pos[0], pos[1], pos[2], ord + 1,
+         kind == MARK_REVERSE ? "stop and turn round" : "uncouple", MarkIndex(real, key, wp, ord, kind) < 0 ? "OFF" : "ON");
+}
+
+// The train window: two buttons below the game's signal button. The upper one
+// switches reversing for this train (as key_train), the lower one sets the
+// most wagons a supply base hands it (left click +1, right click -1; past
+// hub_limit_max and below 1: no limit). The keys keep working.
+#define RVA_RCLICK 0xA54E93           // u8: a right click this frame (0xA54E90/91 left down/click, 92/93 right)
+
+static bool Hover(BYTE* window, float x, float y, float size)
+{
+    float m[3] = { 0, 0, 0 };
+    g_mouse(g_exeBase + RVA_INPUT, m);
+    return *(window + W_ACTIVE) && fabsf(m[0] - x) <= size / 2 && fabsf(m[1] - y) <= size / 2;
+}
+
+static void Tooltip(BYTE* ui, const wchar_t* tip)
+{
+    wcsncpy((wchar_t*)(ui + UI_TOOLTIP), tip, 160);
+    ((wchar_t*)(ui + UI_TOOLTIP))[159] = 0;
+}
+
+static void WindowButtons(BYTE* ui, BYTE* window, BYTE* lead)
+{
+    if (!LoadIcons()) return;
+    ReloadIndicatorSettings();
+    float sc = 1.0f, wx = 0, wy = 0, ox = 0, oy = 0;
+    Rd(g_exeBase, RVA_UI_SCALE, &sc);
+    if (!(sc > 0.25f && sc < 8.0f)) sc = 1.0f;
+    if (!Rd(window, W_POS_X, &wx) || !Rd(window, W_POS_Y, &wy) || !Rd(window, W_OFF_X, &ox) || !Rd(window, W_OFF_Y, &oy)) return;
+    float size = sc * 50.0f, x = wx + ox + sc * cfg.buttonX, y1 = wy + oy + sc * cfg.buttonY, y2 = y1 + sc * 52.0f;
+    bool ru = T == &kRussian;
+
+    EnterCriticalSection(&g_lock);
+    Train* t = Current(lead, false);
+    int chosen = t ? t->chosen : 0, limit = t ? t->hubLimit : 0;
+    LeaveCriticalSection(&g_lock);
+
+    bool h1 = Hover(window, x, y1, size), h2 = Hover(window, x, y2, size);
+    // green while this train reverses: its own switch, or all trains of its class (Scripts menu)
+    bool passenger = IsPassengerTrain(lead);
+    bool classOn = passenger ? g_allPassenger != 0 : g_allFreight != 0;
+    DrawIcon(g_icons[ICON_PUSH + (chosen || classOn ? 1 : 0)], x, y1, size, h1 ? 1.0f : 0.8f);
+    DrawIcon(g_icons[ICON_LIMIT + (limit ? 1 : 0)], x, y2, size, h2 ? 1.0f : 0.8f);
+    if (limit && g_font) {
+        wchar_t n[8];
+        _snwprintf_s(n, 8, _TRUNCATE, L"%d", limit);
+        float tw = (float)wcslen(n) * g_fontPx * 0.55f;
+        Text(x - tw / 2, y2 - size * 0.42f, limit ? 0xFF289628u : 0xFF3C3930u, n);
+    }
+
+    static BYTE* lastWindow;
+    if (cfg.research && window != lastWindow) {
+        lastWindow = window;
+        Logf("railreverse  train window %p: at %.0f,%.0f + %.0f,%.0f, scale %.2f, buttons at %.0f,%.0f and %.0f,%.0f",
+             window, wx, wy, ox, oy, sc, x, y1, x, y2);
+    }
+    if (!h1 && !h2) return;
+    BYTE* click = g_exeBase + RVA_CLICK;
+    BYTE* rclick = g_exeBase + RVA_RCLICK;
+    wchar_t tip[160];
+    if (h1) {
+        wchar_t kTrain[40];
+        KeyText(&cfg.keyTrain, kTrain, 40);
+        _snwprintf_s(tip, 160, _TRUNCATE,
+                     ru ? L"Реверс выбранного поезда: %ls\r\nЛокомотив толкает вагоны задним ходом.\r\nНажмите, чтобы %ls (%ls)\r\nВсе %ls: %ls (меню Скрипты)"
+                        : L"Reversing for the selected train: %ls\r\nThe locomotive pushes its wagons backwards.\r\nClick to switch %ls (%ls)\r\nAll %ls trains: %ls (Scripts menu)",
+                     chosen ? (ru ? L"ВКЛ." : L"ON") : (ru ? L"выкл." : L"off"),
+                     chosen ? (ru ? L"выключить" : L"off") : (ru ? L"включить" : L"on"), kTrain,
+                     passenger ? (ru ? L"пассажирские" : L"passenger") : (ru ? L"грузовые" : L"freight"),
+                     classOn ? (ru ? L"вкл." : L"on") : (ru ? L"выкл." : L"off"));
+        Tooltip(ui, tip);
+        if (*click) {
+            *click = 0;
+            EnterCriticalSection(&g_lock);
+            if (Train* c = Current(lead, true)) chosen = c->chosen = !c->chosen;
+            LeaveCriticalSection(&g_lock);
+            Logf("railreverse  train %p: reversing %s (button)", lead, chosen ? "ON" : "off");
+        }
+        return;
+    }
+    wchar_t now[40], kReset[40];
+    KeyText(&cfg.keyLimitReset, kReset, 40);
+    if (limit) _snwprintf_s(now, 40, _TRUNCATE, ru ? L"не больше %d" : L"at most %d", limit);
+    else wcscpy(now, ru ? L"без ограничения" : L"no limit");
+    _snwprintf_s(tip, 160, _TRUNCATE,
+                 ru ? L"Вагоны с базы снабжения: %ls\r\nЛевый клик +1, правый -1\r\nСброс на «без ограничения»: %ls"
+                    : L"Wagons from a supply base: %ls\r\nLeft click +1, right click -1\r\nBack to no limit: %ls",
+                 now, kReset);
+    Tooltip(ui, tip);
+    int step = *click ? 1 : *rclick ? -1 : 0;
+    if (!step) return;
+    *click = 0;
+    *rclick = 0;
+    EnterCriticalSection(&g_lock);
+    if (Train* c = Current(lead, true)) {
+        c->hubLimit = StepLimit(c->hubLimit, step);
+        limit = c->hubLimit;
+    }
+    LeaveCriticalSection(&g_lock);
+    Logf("railreverse  train %p: hub limit %d%s (button)", lead, limit, limit ? " wagons" : " (none)");
+}
+
+// A train heading for a waypoint marked "uncouple": it brakes to stand just
+// short of it, then leaves its wagons there. The waypoint is a node of its
+// planned way (+0x6A0); the game counts it passed when the train heads for it
+// (end of FUN_1406a7520), see MarkedStop.
+#define V_STOPS_B      0x680      // vector of building*, 0 for a waypoint
+#define V_STOPS_E      0x688
+#define V_RECORDS_B    0x638      // a record per stop, REC_SIZE each
+#define V_STOP_AT      0x698      // int: the stop it is heading for
+#define STOP_SHORT_M   1.5f       // stands this far before the waypoint
+#define BRAKE_MS2      1.2f       // braking towards it, m/s^2: from 40 km/h it starts ~50 m out
+
+// Research: why a train with wagons is not taken, every 2 s.
+static void Why(BYTE* lead, const char* why, int cur, int idx, int ng)
+{
+    static DWORD last;
+    if (!cfg.research || GetTickCount() - last < 2000) return;
+    BYTE** w;
+    if (Wagons(lead, &w) <= 0) return;
+    last = GetTickCount();
+    Logf("railreverse  [stop] train %p not taken: %s (on segment %d of %d, route index %d; marks: %d, first at %.1f %.1f %.1f)",
+         lead, why, cur, ng, idx, g_markCount, g_marks[0].at[0], g_marks[0].at[1], g_marks[0].at[2]);
+}
+
+// Is this waypoint one of the train's stops?
+static bool InSchedule(BYTE* lead, BYTE* wp)
+{
+    BYTE *sb = 0, *se = 0, *recs = 0;
+    if (!Rd(lead, V_STOPS_B, &sb) || !Rd(lead, V_STOPS_E, &se) || !Rd(lead, V_RECORDS_B, &recs) || !sb || !recs) return false;
+    int n = se > sb ? (int)((se - sb) / 8) : 0;
+    if (!ReadablePtr(sb, (size_t)n * 8)) return false;
+    for (int i = 0; i < n; ++i) {
+        BYTE* p = 0;
+        if (!((BYTE**)sb)[i] && Rd(recs + (size_t)i * REC_SIZE, REC_WAYPOINT, &p) && p == wp) return true;
+    }
+    return false;
+}
+
+// Stand still and leave the wagons at this waypoint; the locomotive goes on
+// to its next stop. That step is taken here: a pushing train is turned round
+// first, and then the game no longer sees it at the waypoint. Returns whether
+// the stop moved on.
+static bool LeaveWagons(BYTE* lead, BYTE* wp)
+{
+    *(float*)(lead + V_SPEED) = 0.0f;
+    LeftAdd(lead, wp);
+    Logf("railreverse  [stop] train %p leaves its wagons at the marked waypoint %p", lead, wp);
+    Uncouple(lead);
+    BYTE *sb = 0, *se = 0, *recs = 0, *cur = 0;
+    int at = -1;
+    Rd(lead, V_STOPS_B, &sb); Rd(lead, V_STOPS_E, &se); Rd(lead, V_STOP_AT, &at); Rd(lead, V_RECORDS_B, &recs);
+    int n = sb && se > sb ? (int)((se - sb) / 8) : 0;
+    if (at < 0 || at >= n || !recs || ((BYTE**)sb)[at] || !Rd(recs + (size_t)at * REC_SIZE, REC_WAYPOINT, &cur) || cur != wp)
+        return false;                                      // the game has already moved it on
+    *(int*)(lead + V_STOP_AT) = (at + 1) % n;
+    *(short*)(lead + 0xD3A) = 1;                           // plan the way again, as the game does on passing a waypoint
+    Logf("railreverse  [stop] train %p: stop %d done, on to stop %d", lead, at + 1, (at + 1) % n + 1);
+    return true;
+}
+
+// The game counts a waypoint passed as soon as the train enters the segment
+// that ends at it (its stop index moves on long before it gets there), so the
+// stop index is no guide: the marked waypoint is looked for among the nodes
+// of the way ahead. Segment j of +0x6B8 runs from node j to node j + 1 of
+// +0x6A0; the train is on the one that is +0x798 (+0x700 is the node it
+// heads for).
+
+static void TurnStop(BYTE* lead);
+
+static void MarkedStop(BYTE* lead, const float* at3)
+{
+    if (!g_markCount) return;
+    TurnStop(lead);
+    BYTE** w;
+    if (Wagons(lead, &w) <= 0) return;
+    BYTE *nb = 0, *ne = 0, *gb = 0, *ge = 0, *seg = 0;
+    int idx = -1;
+    float pos = 0.0f;
+    Rd(lead, V_ROUTE_BEGIN, &nb); Rd(lead, V_ROUTE_END, &ne); Rd(lead, V_SEGS_BEGIN, &gb); Rd(lead, V_SEGS_END, &ge);
+    Rd(lead, V_ROUTE_INDEX, &idx); Rd(lead, V_SEGMENT, &seg); Rd(lead, V_SEGMENT_POS, &pos);
+    int nn = nb && ne > nb ? (int)((ne - nb) / 8) : 0, ng = gb && ge > gb ? (int)((ge - gb) / 8) : 0;
+    if (!seg || !ReadablePtr(nb, (size_t)nn * 8) || !ReadablePtr(gb, (size_t)ng * 8)) return;
+    int cur = 0;
+    while (cur < ng && ((BYTE**)gb)[cur] != seg) ++cur;
+    if (cur >= ng) { Why(lead, "its segment is not on its planned way", -1, idx, ng); return; }
+
+    // its current stop, the visit marked (the stop is held there, RR_PassWaypoint), on its way ahead
+    BYTE *wp = 0, *swp = 0;
+    int sord = 0, sat = -1;
+    void* skey = TrainStop(lead, &swp, &sord, &sat);
+    bool marked = skey && swp && MarkIndex(RouteOf(lead), swp, swp, sord) >= 0;
+    float d = SegLength(seg) - pos;
+    int k = cur + 1;
+    for (; marked && k < nn && d < 400.0f; ++k) {
+        if (((BYTE**)nb)[k] == swp) { wp = swp; break; }
+        if (k < ng) d += SegLength(((BYTE**)gb)[k]);
+    }
+    if (!wp) {
+        Why(lead, "no marked waypoint of its schedule ahead", cur, idx, ng);
+        // research: what it heads for, and the nodes it has planned, every 2 s
+        static DWORD last;
+        BYTE *sb = 0, *se = 0, *recs = 0, *swp = 0;
+        int at = -1;
+        Rd(lead, V_STOPS_B, &sb); Rd(lead, V_STOPS_E, &se); Rd(lead, V_STOP_AT, &at); Rd(lead, V_RECORDS_B, &recs);
+        int n = sb && se > sb && ReadablePtr(sb, (size_t)(se - sb)) ? (int)((se - sb) / 8) : 0;
+        bool ours = false;                                 // only a train with the marked waypoint in its schedule
+        for (int i = 0; i < n && recs && !ours; ++i) {
+            BYTE* p = 0;
+            if (!((BYTE**)sb)[i] && Rd(recs + (size_t)i * REC_SIZE, REC_WAYPOINT, &p) && p) ours = MarkIndex(RouteOf(lead), p, p, ANY_VISIT) >= 0;
+        }
+        if (cfg.research && ours && GetTickCount() - last >= 2000) {
+            last = GetTickCount();
+            BYTE* sbld = at >= 0 && at < n ? ((BYTE**)sb)[at] : 0;
+            if (at >= 0 && at < n && recs) Rd(recs + (size_t)at * REC_SIZE, REC_WAYPOINT, &swp);
+            float q[3] = { 0, 0, 0 };
+            if (swp) { Rd(swp, 4, &q[0]); Rd(swp, 12, &q[2]); }
+            char line[1024];
+            int len = _snprintf_s(line, sizeof(line), _TRUNCATE,
+                                  "railreverse  [stop]   heading for stop %d of %d (building %p, waypoint %p at %.1f %.1f); "
+                                  "%d nodes, %d segments, on %d:", at + 1, n, sbld, swp, q[0], q[2], nn, ng, cur);
+            for (int i = 0; i < nn && i < 12 && len > 0; ++i) {
+                BYTE* node = ((BYTE**)nb)[i];
+                float r[3] = { 0, 0, 0 };
+                if (node) { Rd(node, 4, &r[0]); Rd(node, 12, &r[2]); }
+                float mx = r[0] - g_marks[0].at[0], mz = r[2] - g_marks[0].at[2];
+                len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " [%d] %p %.0f,%.0f%s%s", i, node, r[0], r[2],
+                                   node && node == swp ? " =stop" : "", mx * mx + mz * mz < 9.0f ? " =MARK" : "");
+            }
+            Logf("%s", line);
+        }
+        return;
+    }
+    Left* left = LeftOf(lead);
+    if (left && left->wp == wp && left->run < AGAIN_M) return;   // it has just left its wagons here
+    d -= STOP_SHORT_M;
+
+    float v = 0.0f;
+    Rd(lead, V_SPEED, &v);
+    float vmax = d > 0.0f ? sqrtf(2.0f * BRAKE_MS2 * d) * 3.6f : 0.0f;
+    if (v > vmax) *(float*)(lead + V_SPEED) = vmax;
+    static DWORD last;
+    if (cfg.research && d < 80.0f && GetTickCount() - last > 1000) {
+        last = GetTickCount();
+        Logf("railreverse  [stop] train %p: %.1f m to the marked waypoint %p (node %d), %.1f km/h, cap %.1f", lead, d, wp,
+             k, v, vmax);
+    }
+    if (d > 0.5f) return;                                  // a standing train is not redrawn: act while it still rolls
+
+    float w3[3] = { 0, 0, 0 };
+    Rd(wp, 4, &w3[0]); Rd(wp, 8, &w3[1]); Rd(wp, 12, &w3[2]);
+    float dx = at3 ? at3[0] - w3[0] : 0, dz = at3 ? at3[2] - w3[2] : 0;
+    Logf("railreverse  [stop] train %p at the marked waypoint %p: locomotive at %.1f %.1f, waypoint at %.1f %.1f, %.1f m "
+         "apart (way: %.1f m left, node %d of %d, on segment %d of %d, route index %d)",
+         lead, wp, at3 ? at3[0] : 0, at3 ? at3[2] : 0, w3[0], w3[2], sqrtf(dx * dx + dz * dz), d, k, nn, cur, ng, idx);
+    LeaveWagons(lead, wp);
+}
+
+// A train heading for its stop marked "stop and turn round" brakes to stand
+// at it, as for a marked uncouple; the game then turns it round there and it
+// sets off again from standing (the speed is zeroed in HookFlip).
+#define TURN_CREEP_KMH 1.5f           // the last metre: it has to get there, not stop just short
+
+static void TurnStop(BYTE* lead)
+{
+    BYTE* swp = 0;
+    int sord = 0, sat = -1;
+    void* skey = TrainStop(lead, &swp, &sord, &sat);
+    if (!skey || !swp || MarkIndex(RouteOf(lead), swp, swp, sord, MARK_REVERSE) < 0) return;
+    BYTE *nb = 0, *ne = 0, *gb = 0, *ge = 0, *seg = 0;
+    float pos = 0.0f;
+    Rd(lead, V_ROUTE_BEGIN, &nb); Rd(lead, V_ROUTE_END, &ne); Rd(lead, V_SEGS_BEGIN, &gb); Rd(lead, V_SEGS_END, &ge);
+    Rd(lead, V_SEGMENT, &seg); Rd(lead, V_SEGMENT_POS, &pos);
+    int nn = nb && ne > nb ? (int)((ne - nb) / 8) : 0, ng = gb && ge > gb ? (int)((ge - gb) / 8) : 0;
+    if (!seg || !ReadablePtr(nb, (size_t)nn * 8) || !ReadablePtr(gb, (size_t)ng * 8)) return;
+    int cur = 0;
+    while (cur < ng && ((BYTE**)gb)[cur] != seg) ++cur;
+    if (cur >= ng) return;
+    float d = SegLength(seg) - pos;
+    int k = cur + 1;
+    for (; k < nn && d < 400.0f; ++k) {
+        if (((BYTE**)nb)[k] == swp) break;
+        if (k < ng) d += SegLength(((BYTE**)gb)[k]);
+    }
+    if (k >= nn || d >= 400.0f) return;
+    float v = 0.0f;
+    Rd(lead, V_SPEED, &v);
+    float vmax = d > 0.0f ? sqrtf(2.0f * BRAKE_MS2 * d) * 3.6f : 0.0f;
+    if (vmax < TURN_CREEP_KMH) vmax = TURN_CREEP_KMH;
+    if (v > vmax) *(float*)(lead + V_SPEED) = vmax;
+}
+
+// Holding a marked waypoint. At the end of FUN_1406a7520 the game counts a
+// waypoint stop passed once the node the train heads for (+0x6A0[+0x700]) is
+// that waypoint: its stop moves on and its way is planned to the next stop,
+// long before it gets there. For a marked one, with wagons on, that check is
+// answered "not yet": the train keeps heading for the waypoint, the game
+// brakes it to stand there as at the end of any way, and once it stands it
+// leaves its wagons and the check goes through. 1.1.1.9 (off on another build).
+static const short SIG_PASS[] = {     // imul r8,rdx,198h; ...; cmp [r8+rdx+190h],rcx; jne; lea ecx,[r9+1]; mov [rsi+698h],ecx
+    0x4c,0x69,0xc2,0x98,0x01,0x00,0x00, 0x48,0x8b,0x96,0x38,0x06,0x00,0x00, 0x48,0x8b,0x07, 0x48,0x8b,0x0c,0xc8,
+    0x49,0x39,0x8c,0x10,0x90,0x01,0x00,0x00, 0x75,0x31, 0x41,0x8d,0x49,0x01, 0x89,0x8e,0x98,0x06,0x00,0x00,
+};
+#define PASS_CMP_AT 21                // the cmp + jne, 10 bytes: call stub; test al,al; je +32h; nop
+
+// How far the train still is from the node it heads for (+0x6A0[+0x700]):
+// segment j of +0x6B8 runs from node j to node j + 1. 0 once it is past it,
+// -1 when its segment is not on its way.
+static float ToNode(BYTE* v)
+{
+    BYTE *gb = 0, *ge = 0, *seg = 0;
+    int idx = -1;
+    float pos = 0.0f;
+    Rd(v, V_SEGS_BEGIN, &gb); Rd(v, V_SEGS_END, &ge); Rd(v, V_ROUTE_INDEX, &idx); Rd(v, V_SEGMENT, &seg);
+    Rd(v, V_SEGMENT_POS, &pos);
+    int ng = gb && ge > gb ? (int)((ge - gb) / 8) : 0;
+    if (!seg || !ReadablePtr(gb, (size_t)ng * 8)) return -1.0f;
+    int cur = 0;
+    while (cur < ng && ((BYTE**)gb)[cur] != seg) ++cur;
+    if (cur >= ng) return -1.0f;
+    if (cur >= idx) return 0.0f;
+    float d = SegLength(seg) - pos;
+    for (int j = cur + 1; j < idx && j < ng; ++j) d += SegLength(((BYTE**)gb)[j]);
+    return d;
+}
+
+#define AT_WAYPOINT_M 5.0f            // a locomotive running round has got to a waypoint this close
+#define STOOD_MS      10000           // or after standing this long short of it (a signal, a train)
+
+extern "C" int RR_PassWaypoint(BYTE* v, BYTE* recWp, BYTE* node)
+{
+    if (recWp != node) return 0;                           // the game's own test
+    Left* left = LeftOf(v);
+    if (left && left->wp == node && left->run < AGAIN_M) return 1;   // left its wagons here: on it goes
+    BYTE** lw;
+    if (left && Wagons(v, &lw) == 0) {                     // signals taken as stops too
+        // Running round its wagons: the waypoints are where it turns, it
+        // has to get there (the game would count it passed as soon as it
+        // enters the segment and plan on from the middle of it). Its way
+        // ends at the waypoint, so the game stops it there.
+        float d = ToNode(v), speed = 0.0f;
+        Rd(v, V_SPEED, &speed);
+        DWORD now = GetTickCount();
+        if (d >= 0.0f && d < AT_WAYPOINT_M) { left->stood = 0; return 1; }
+        if (speed > 0.5f) { left->stood = 0; return 0; }
+        if (!left->stood) left->stood = now;
+        if (now - left->stood < STOOD_MS) return 0;
+        left->stood = 0;
+        Logf("railreverse  [stop] locomotive %p stood %.1f m short of waypoint %p: counted passed", v, d, node);
+        return 1;
+    }
+    BYTE* swp = 0;
+    int sord = 0, sat = -1;
+    TrainStop(v, &swp, &sord, &sat);
+    if (g_markCount && swp == node && MarkIndex(RouteOf(v), node, node, sord, MARK_REVERSE) >= 0) {
+        // Stop and turn round: the stop counts once the train is there (its way
+        // ends there, the game stops it), the way on is planned from there.
+        float d = ToNode(v), speed = 0.0f;
+        Rd(v, V_SPEED, &speed);
+        if (speed > 0.5f) return 0;                        // it is to stop there, not roll by
+        if (d >= 0.0f && d < AT_WAYPOINT_M) return 1;
+        static BYTE* stoodLead;
+        static DWORD stoodSince;
+        if (stoodLead != v) stoodLead = v, stoodSince = GetTickCount();
+        if (GetTickCount() - stoodSince < STOOD_MS) return 0;
+        stoodLead = 0;
+        Logf("railreverse  [stop] train %p stood %.1f m short of its stop-and-turn waypoint %p: counted passed", v, d, node);
+        return 1;
+    }
+    if (!g_markCount || swp != node || MarkIndex(RouteOf(v), node, node, sord) < 0) return 1;
+    BYTE** w;
+    if (Wagons(v, &w) <= 0) return 1;
+    float speed = 0.0f;
+    Rd(v, V_SPEED, &speed);
+    if (speed > 0.5f) return 0;                            // still on its way to it
+    Logf("railreverse  [stop] train %p stands at the marked waypoint %p", v, node);
+    return LeaveWagons(v, node) ? 0 : 1;                   // moved on already: the game must not do it again
+}
+
+// rsi = the vehicle, rcx = the node it heads for, [r8+rdx+190h] = its stop's
+// waypoint. r9 (the stop index) and r13 are used after the call.
+extern "C" __attribute__((naked)) void RR_PassThunk(void)
+{
+    __asm__ volatile(
+        "push %r9\n\t"
+        "push %r8\n\t"
+        "push %rdx\n\t"
+        "push %rcx\n\t"
+        "push %r10\n\t"
+        "push %r11\n\t"
+        "sub $0x28, %rsp\n\t"
+        "mov 0x190(%r8,%rdx), %rdx\n\t"
+        "mov %rcx, %r8\n\t"
+        "mov %rsi, %rcx\n\t"
+        "call RR_PassWaypoint\n\t"
+        "add $0x28, %rsp\n\t"
+        "pop %r11\n\t"
+        "pop %r10\n\t"
+        "pop %rcx\n\t"
+        "pop %rdx\n\t"
+        "pop %r8\n\t"
+        "pop %r9\n\t"
+        "ret\n\t");
+}
+
+extern "C" void RR_RouteWindow(BYTE* ui, BYTE* window)
+{
+    g_rowWindow = window;
+    g_rowIdx = 0;
+    g_origRoute(ui, window);
+    g_rowWindow = 0;
+    if (ui && window) {
+        RouteButton(ui, window, MARK_UNCOUPLE);
+        RouteButton(ui, window, MARK_REVERSE);
+    }
 }
 
 // FUN_1406e9b80(ui): draws every open info window.
@@ -1668,6 +3322,8 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     if (cfg.hubLimitMax < 1) cfg.hubLimitMax = 1;
     if (cfg.hubLimitMax > HUB_LIMIT_CEILING) cfg.hubLimitMax = HUB_LIMIT_CEILING;
     cfg.logFlips     = H->configInt(RR_INI, "railreverse", "log_flips", 1);
+    cfg.shunting     = H->configInt(RR_INI, "railreverse", "shunting", 1);
+    cfg.research     = H->configInt(RR_INI, "railreverse", "research_log", 0);
     cfg.indicator    = H->configInt(RR_INI, "railreverse", "indicator", 0);
     cfg.windowButtons = H->configInt(RR_INI, "railreverse", "window_buttons", 1);
     cfg.buttonX      = ConfigFloat("window_button_x", 570.0f);
@@ -1766,8 +3422,20 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     g_texture = (FnTexture)GetProcAddress(g_engine, EXP_TEXTURE);
     g_panelDraw = (FnDraw)GetProcAddress(g_engine, EXP_DRAW);
     if (!g_mouse || !g_texture || !g_panelDraw) {
-        cfg.windowButtons = 0;
-        Logf("railreverse  train window buttons unavailable (engine exports missing)");
+        cfg.windowButtons = cfg.shunting = 0;
+        Logf("railreverse  train window buttons and shunting unavailable (engine exports missing)");
+    }
+    // The buttons, the Scripts menu switches and shunting use fixed 1.1.1.9
+    // addresses besides their signatures (windows, input, the running
+    // scripts, the obstacle map): on another build of the game they stay off.
+    {
+        IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(g_exeBase + ((IMAGE_DOS_HEADER*)g_exeBase)->e_lfanew);
+        g_build119 = nt->FileHeader.TimeDateStamp == BUILD_1119;
+        if (!g_build119) {
+            cfg.windowButtons = cfg.shunting = 0;
+            Logf("railreverse  game build %08lX is not 1.1.1.9 (%08X): train window buttons, Scripts menu switches and "
+                 "shunting off, reversing works", (unsigned long)nt->FileHeader.TimeDateStamp, BUILD_1119);
+        }
     }
     if (!g_sample || !g_rotXY || !FindUnique(SIG(SIG_FLIP)) || !FindUnique(SIG(SIG_XFORM))) {
         Logf("railreverse  %s not found - nothing hooked",
@@ -1836,6 +3504,63 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     else
         Logf("railreverse  saves: vehicle list at +%06llX, state kept in " SIDECAR,
              (unsigned long long)((BYTE*)g_vehicles - g_exeBase));
+    if (cfg.shunting) {
+        g_split = (FnSplit)FindUnique(SIG(SIG_SPLIT));
+        g_blockState = (FnBlockState)FindUnique(SIG(SIG_BLOCKSTATE));
+        if (!g_blockState) Logf("railreverse  block state not found: signals may stay red where wagons were sold");
+        g_couple3 = (FnCouple)FindUnique(SIG(SIG_COUPLE));
+        g_unreserve = (FnUnreserve)FindUnique(SIG(SIG_UNRESERVE));
+        if (!g_unreserve) Logf("railreverse  block release not found: coupled wagons may keep their blocks");
+        g_occupy = (FnOccupy)FindUnique(SIG(SIG_OCCUPY));
+        if (g_unreserve && g_occupy)
+            Hook(SIG(SIG_PLAN), PLAN_STOLEN, (void*)HookPlan, (void**)&g_origPlan, "way planner");
+        else
+            Logf("railreverse  way planner not hooked: light locomotives wait at signals before wagons");
+        Hook(SIG(SIG_SIGNAL), SIGNAL_STOLEN, (void*)HookSignal, (void**)&g_origSignal, "signal check");
+        Logf("railreverse  uncouple test (CTRL+F11): %s, couple %s, obstacle lookup %s", g_split ? "on" : "split not found",
+             g_couple3 ? "on" : "not found",
+             memcmp(g_exeBase + RVA_VEHICLE_AT, VEHICLE_AT_HEAD, sizeof(VEHICLE_AT_HEAD)) ? "not found" : "on");
+
+        // holding marked waypoints: the game's "waypoint passed" test calls RR_PassThunk
+        if (BYTE* pass = FindUnique(SIG(SIG_PASS))) {
+            BYTE* at = pass + PASS_CMP_AT;
+            BYTE* hop = AllocNear(at, 16);
+            if (hop) {
+                hop[0] = 0xFF; hop[1] = 0x25; *(INT32*)(hop + 2) = 0;
+                *(void**)(hop + 6) = (void*)RR_PassThunk;
+                BYTE code[10] = { 0xE8, 0, 0, 0, 0, 0x84, 0xC0, 0x74, 0x32, 0x90 };
+                *(INT32*)(code + 1) = (INT32)(hop - (at + 5));
+                DWORD old;
+                VirtualProtect(at, 10, PAGE_EXECUTE_READWRITE, &old);
+                memcpy(at, code, 10);
+                VirtualProtect(at, 10, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), at, 10);
+                Logf("railreverse  marked waypoints: pass test at +%06llX redirected", (unsigned long long)(at - g_exeBase));
+            }
+        } else {
+            Logf("railreverse  marked waypoints: pass test not found");
+        }
+
+        // the route window button: its one call site goes through a stub to RR_RouteWindow
+        BYTE* site = FindUnique(SIG(SIG_ROUTE_CALL));
+        BYTE* stub = site && g_mouse && g_texture && g_panelDraw ? AllocNear(site, 16) : 0;
+        if (stub) {
+            site += ROUTE_CALL_AT;
+            g_origRoute = (FnRouteWindow)(site + 5 + *(INT32*)(site + 1));
+            stub[0] = 0xFF; stub[1] = 0x25; *(INT32*)(stub + 2) = 0;
+            *(void**)(stub + 6) = (void*)RR_RouteWindow;
+            DWORD old;
+            VirtualProtect(site, 5, PAGE_EXECUTE_READWRITE, &old);
+            *(INT32*)(site + 1) = (INT32)(stub - (site + 5));
+            VirtualProtect(site, 5, old, &old);
+            FlushInstructionCache(GetCurrentProcess(), site, 5);
+            Logf("railreverse  route window button: call at +%06llX redirected", (unsigned long long)(site - g_exeBase));
+            if (!PatchIat(g_exe, DLL_ENGINE, EXP_9PATCH, (void*)Hook9Patch, (void**)&g_orig9Patch, "railreverse 9-patch"))
+                Logf("railreverse  route window rows: no marks on the rows (9-patch import not patched)");
+        } else {
+            Logf("railreverse  route window button unavailable (%s)", !site ? "call site not found" : "engine exports missing");
+        }
+    }
     Logf("railreverse  ready");
     return 0;
 }

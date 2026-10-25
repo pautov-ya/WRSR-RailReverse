@@ -1,14 +1,12 @@
 <!doctype html>
-<html><head><meta charset="utf-8"><title>Rail Reverse preview</title>
+<html><head><meta charset="utf-8"><title>Rail Operations preview</title>
 <style>html,body{margin:0;padding:0;background:#efe1bd}svg{display:block}</style>
 </head><body>
-<!-- Steam Workshop preview, 1024x1024. Render: art/render.sh -->
-<svg id="s" xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<!-- Steam Workshop preview, 1024x1024. Render: art/render.sh
+     Three tracks in the style of the collection background: wagons left
+     standing, the locomotive running round them, a train pushed backwards. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
 <defs>
-  <filter id="grain" x="0" y="0" width="100%" height="100%">
-    <feTurbulence type="fractalNoise" baseFrequency="0.9" numOctaves="1" seed="7" result="n"/>
-    <feColorMatrix type="matrix" values="0 0 0 0 0.25  0 0 0 0 0.17  0 0 0 0 0.08  0 0 0 0.55 -0.12"/>
-  </filter>
   <filter id="blotch" x="0" y="0" width="100%" height="100%">
     <feTurbulence type="fractalNoise" baseFrequency="0.012" numOctaves="3" seed="3"/>
     <feColorMatrix type="matrix" values="0 0 0 0 0.35  0 0 0 0 0.22  0 0 0 0 0.1  0 0 0 0.9 -0.42"/>
@@ -17,70 +15,60 @@
     <stop offset="60%" stop-color="#000" stop-opacity="0"/>
     <stop offset="100%" stop-color="#2a1208" stop-opacity="0.45"/>
   </radialGradient>
-  <clipPath id="sky"><rect x="28" y="28" width="968" height="680"/></clipPath>
-  <clipPath id="frame"><rect x="28" y="28" width="968" height="968"/></clipPath>
+  <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+    <feDropShadow dx="3" dy="4" stdDeviation="2" flood-color="#1a0d08" flood-opacity=".4"/>
+  </filter>
+  <clipPath id="sky"><rect x="28" y="28" width="968" height="380"/></clipPath>
 </defs>
 
 <rect width="1024" height="1024" fill="#efe1bd"/>
 
 <g clip-path="url(#sky)">
-  <rect x="0" y="0" width="1024" height="720" fill="#e9c779"/>
+  <rect x="0" y="0" width="1024" height="410" fill="#e9c779"/>
   <g id="rays"></g>
-  <circle cx="770" cy="560" r="150" fill="#f3e2b4"/>
-  <circle cx="770" cy="560" r="150" fill="none" stroke="#c9922f" stroke-width="10" opacity=".6"/>
-
-  <!-- factories -->
-  <g fill="#6e3324" opacity=".85">
-    <rect x="300" y="300" width="26" height="300"/><rect x="295" y="320" width="36" height="10"/><rect x="295" y="380" width="36" height="10"/>
-    <rect x="352" y="360" width="20" height="240"/>
-    <rect x="460" y="260" width="30" height="340"/><rect x="455" y="285" width="40" height="10"/><rect x="455" y="350" width="40" height="10"/>
-    <rect x="515" y="340" width="22" height="260"/>
-    <path d="M240 600 V470 l50 -30 v30 l50 -30 v30 l50 -30 v30 l50 -30 v30 l50 -30 V600 Z"/>
-    <path d="M540 600 V440 h120 v-50 h40 v50 h70 V600 Z"/>
-    <rect x="900" y="330" width="24" height="270"/><rect x="895" y="350" width="34" height="9"/>
-    <path d="M820 600 V500 h170 V600 Z"/>
+  <circle cx="512" cy="410" r="130" fill="#f3e2b4"/>
+  <circle cx="512" cy="410" r="130" fill="none" stroke="#c9922f" stroke-width="10" opacity=".6"/>
+  <!-- factories, smoke -->
+  <g transform="translate(40 -190)">
+    <g fill="#6e3324" opacity=".85">
+      <rect x="120" y="330" width="24" height="270"/><rect x="115" y="350" width="34" height="9"/>
+      <path d="M60 600 V470 l45 -26 v26 l45 -26 v26 l45 -26 v26 l45 -26 V600 Z"/>
+      <rect x="300" y="300" width="26" height="300"/><rect x="295" y="320" width="36" height="10"/><rect x="295" y="380" width="36" height="10"/>
+      <rect x="352" y="360" width="20" height="240"/>
+      <rect x="560" y="280" width="30" height="320"/><rect x="555" y="305" width="40" height="10"/><rect x="555" y="370" width="40" height="10"/>
+      <path d="M600 600 V440 h120 v-50 h40 v50 h70 V600 Z"/>
+      <rect x="760" y="340" width="20" height="260"/>
+    </g>
+    <g fill="#7a5244" opacity=".45">
+      <circle cx="132" cy="312" r="20"/><circle cx="150" cy="280" r="27"/><circle cx="180" cy="252" r="30"/>
+      <circle cx="313" cy="282" r="22"/><circle cx="335" cy="250" r="30"/><circle cx="372" cy="215" r="36"/><circle cx="420" cy="190" r="30"/>
+      <circle cx="575" cy="260" r="24"/><circle cx="600" cy="225" r="32"/><circle cx="645" cy="195" r="38"/><circle cx="700" cy="180" r="30"/>
+    </g>
   </g>
-  <g fill="#7a5244" opacity=".45">
-    <circle cx="313" cy="282" r="22"/><circle cx="335" cy="250" r="30"/><circle cx="372" cy="215" r="36"/><circle cx="420" cy="190" r="30"/>
-    <circle cx="475" cy="240" r="24"/><circle cx="500" cy="205" r="32"/><circle cx="545" cy="175" r="38"/><circle cx="600" cy="160" r="30"/>
-    <circle cx="912" cy="310" r="20"/><circle cx="930" cy="280" r="27"/><circle cx="962" cy="252" r="30"/>
-  </g>
-
-  <!-- reverse emblem -->
+  <!-- emblem: a railway signal -->
   <g transform="translate(880 150)">
     <circle r="82" fill="#f3e2b4" stroke="#b2231a" stroke-width="12"/>
     <circle r="64" fill="none" stroke="#241a16" stroke-width="3"/>
-    <path d="M-44 -14 H34 V-34 L58 -6 L34 22 V2 H-44 Z" fill="#b2231a" transform="translate(0 -12)"/>
-    <path d="M44 14 H-34 V34 L-58 6 L-34 -22 V-2 H44 Z" fill="#241a16" transform="translate(0 12)"/>
+    <rect x="-7" y="10" width="14" height="52" fill="#241a16"/>
+    <rect x="-24" y="56" width="48" height="8" fill="#241a16"/>
+    <rect x="-20" y="-56" width="40" height="72" rx="20" fill="#241a16"/>
+    <circle cy="-38" r="9" fill="#b2231a"/>
+    <circle cy="-20" r="9" fill="#e3a93a"/>
+    <circle cy="-2" r="9" fill="#5f8a3a"/>
   </g>
-
-  <!-- embankment and track -->
-  <path d="M0 640 H1024 V720 H0 Z" fill="#4a2a1f"/>
-  <path d="M0 646 H1024" stroke="#2a1a14" stroke-width="10"/>
-  <g id="sleepers" fill="#2a1a14"></g>
-  <path d="M0 638 H1024" stroke="#f0dcae" stroke-width="5"/>
-
-  <!-- speed lines behind the locomotive (it pushes to the left) -->
-  <g stroke="#241a16" stroke-width="7" stroke-linecap="round">
-    <path d="M950 520 H1010"/><path d="M965 550 H1020"/><path d="M945 580 H1000"/>
-  </g>
-
-  <!-- train: wagons on the left, shunting diesel on the right, moving left -->
-  <g id="train" fill="#241a16"></g>
-
-  <!-- direction arrow over the wagons -->
-  <path d="M130 382 H420 V352 L470 410 L420 468 V438 H130 Z" fill="#b2231a" stroke="#f3e2b4" stroke-width="7" transform="rotate(180 300 410)"/>
 </g>
+
+<g id="ground"></g>
 
 <!-- title band -->
 <rect x="28" y="708" width="968" height="288" fill="#8a1a12"/>
 <rect x="28" y="708" width="968" height="12" fill="#241a16"/>
-<text x="512" y="880" text-anchor="middle" font-family="Impact" font-size="176" textLength="900" lengthAdjust="spacingAndGlyphs" fill="#1a100c">RAIL REVERSE</text>
-<text x="506" y="872" text-anchor="middle" font-family="Impact" font-size="176" textLength="900" lengthAdjust="spacingAndGlyphs" fill="#f3e2b4">RAIL REVERSE</text>
+<text x="512" y="880" text-anchor="middle" font-family="Impact" font-size="150" textLength="900" lengthAdjust="spacingAndGlyphs" fill="#1a100c">RAIL OPERATIONS</text>
+<text x="506" y="872" text-anchor="middle" font-family="Impact" font-size="150" textLength="900" lengthAdjust="spacingAndGlyphs" fill="#f3e2b4">RAIL OPERATIONS</text>
 <g fill="#e3a93a">
   <rect x="80" y="928" width="150" height="8"/><rect x="794" y="928" width="150" height="8"/>
 </g>
-<text x="512" y="958" text-anchor="middle" font-family="Impact" font-size="66" letter-spacing="4" fill="#e3a93a">РЕВЕРС ПОЕЗДОВ</text>
+<text x="512" y="958" text-anchor="middle" font-family="Impact" font-size="66" letter-spacing="4" fill="#e3a93a">Ж/Д ДВИЖЕНИЕ</text>
 
 <!-- paper -->
 <rect width="1024" height="1024" filter="url(#blotch)" opacity=".5"/>
@@ -92,67 +80,73 @@
 <script>
 const NS = 'http://www.w3.org/2000/svg';
 const el = (tag, a, parent) => { const e = document.createElementNS(NS, tag); for (const k in a) e.setAttribute(k, a[k]); parent.appendChild(e); return e; };
+const starPath = (x, y, r, inner) => { let d = ''; for (let i = 0; i < 10; ++i) { const a = -Math.PI / 2 + i * Math.PI / 5, rr = i % 2 ? r * inner : r; d += (i ? 'L' : 'M') + (x + rr * Math.cos(a)).toFixed(1) + ' ' + (y + rr * Math.sin(a)).toFixed(1); } return d + 'Z'; };
 
-// sunburst from behind the locomotive
-const rays = document.getElementById('rays');
-const cx = 770, cy = 560, R = 1600, n = 28;
-for (let i = 0; i < n; i++) {
-  if (i % 2) continue;
-  const a0 = (i / n) * 2 * Math.PI, a1 = ((i + 1) / n) * 2 * Math.PI;
-  const col = (i / 2) % 3 === 0 ? '#9c1f17' : (i / 2) % 3 === 1 ? '#c4321f' : '#b2261b';
-  el('path', { d: `M${cx} ${cy} L${cx + R * Math.cos(a0)} ${cy + R * Math.sin(a0)} L${cx + R * Math.cos(a1)} ${cy + R * Math.sin(a1)} Z`, fill: col }, rays);
+// rays from the sun on the horizon
+{
+  const rays = document.getElementById('rays');
+  const cx = 512, cy = 410, R = 1600, n = 40;
+  for (let i = 0; i < n; i += 2) {
+    const a0 = (i / n) * 2 * Math.PI, a1 = ((i + 1) / n) * 2 * Math.PI;
+    el('path', { d: `M${cx} ${cy} L${cx + R * Math.cos(a0)} ${cy + R * Math.sin(a0)} L${cx + R * Math.cos(a1)} ${cy + R * Math.sin(a1)} Z`,
+                 fill: (i / 2) % 2 ? '#9c1f17' : '#c4321f' }, rays);
+  }
 }
 
-// sleepers
-const sl = document.getElementById('sleepers');
-for (let x = -10; x < 1030; x += 34) el('rect', { x, y: 640, width: 18, height: 14 }, sl);
+// the station: three tracks
+const g = document.getElementById('ground');
+const GROUND = 408, T1 = 508, T2 = 604, T3 = 692;
+el('rect', { x: 28, y: GROUND, width: 968, height: 300, fill: '#5a2f1f' }, g);
+el('rect', { x: 28, y: GROUND, width: 968, height: 10, fill: '#241a16' }, g);
+el('rect', { x: 28, y: GROUND + 10, width: 968, height: 290, fill: '#6e3a26', opacity: .5 }, g);
 
-const t = document.getElementById('train');
-const wheel = (x) => { el('circle', { cx: x, cy: 618, r: 17 }, t); el('circle', { cx: x, cy: 618, r: 6, fill: '#c9922f' }, t); };
-const bogie = (x) => { el('rect', { x: x - 34, y: 604, width: 68, height: 12, rx: 4 }, t); wheel(x - 20); wheel(x + 20); };
-const coupler = (x) => el('rect', { x, y: 584, width: 26, height: 9 }, t);
-
-// boxcars
-function boxcar(x, w) {
-  el('rect', { x, y: 470, width: w, height: 118, rx: 4 }, t);
-  el('path', { d: `M${x - 4} 470 Q${x + w / 2} 446 ${x + w + 4} 470 Z` }, t);
-  for (let rx = x + 18; rx < x + w - 10; rx += 22) el('rect', { x: rx, y: 480, width: 4, height: 100, fill: '#3a2b24' }, t);
-  el('rect', { x: x + w / 2 - 28, y: 486, width: 56, height: 92, fill: '#3a2b24' }, t);
-  el('rect', { x: x + w / 2 - 24, y: 490, width: 48, height: 84 }, t);
-  el('rect', { x: x - 2, y: 586, width: w + 4, height: 12 }, t);
-  bogie(x + 46); bogie(x + w - 46);
+function track(points) {
+  const at = dy => points.map((p, i) => (i ? 'L' : 'M') + p[0] + ' ' + (p[1] + dy)).join(' ');
+  el('path', { d: at(9), fill: 'none', stroke: '#2a1810', 'stroke-width': 12, 'stroke-dasharray': '22 12' }, g);
+  el('path', { d: at(3), fill: 'none', stroke: '#c9a467', 'stroke-width': 6 }, g);
 }
-// tank car
-function tank(x, w) {
-  el('rect', { x, y: 492, width: w, height: 86, rx: 43 }, t);
-  el('rect', { x: x + w / 2 - 22, y: 470, width: 44, height: 26, rx: 4 }, t);
-  el('rect', { x: x + 14, y: 530, width: w - 28, height: 5, fill: '#3a2b24' }, t);
-  el('rect', { x: x - 2, y: 576, width: w + 4, height: 22 }, t);
-  bogie(x + 46); bogie(x + w - 46);
-}
-boxcar(-120, 210);
-coupler(90);
-tank(116, 210);
-coupler(326);
-boxcar(352, 210);
-coupler(562);
+track([[28, T1], [996, T1]]);
+track([[28, T2], [996, T2]]);
+track([[28, T3], [996, T3]]);
+// points between the upper two tracks at both ends: the way round
+track([[60, T2], [150, T1]]);
+track([[870, T2], [960, T1]]);
 
-// TEM2-like shunting diesel, cab at the right end, pushing left
-const L = 588, Rr = 940;
-el('rect', { x: L, y: 576, width: Rr - L, height: 22 }, t);              // frame
-el('path', { d: `M${L + 14} 576 V512 Q${L + 14} 500 ${L + 26} 500 H830 V576 Z` }, t); // long hood
-for (let gx = L + 40; gx < 810; gx += 30) el('rect', { x: gx, y: 512, width: 18, height: 30, fill: '#3a2b24' }, t);
-el('rect', { x: 760, y: 486, width: 22, height: 16 }, t);               // exhaust
-el('path', { d: `M826 576 V440 H${Rr - 8} V576 Z` }, t);                  // cab
-el('path', { d: `M818 444 H${Rr} V432 H818 Z` }, t);                     // roof
-el('rect', { x: 846, y: 456, width: 34, height: 40, fill: '#f3e2b4' }, t);
-el('rect', { x: 890, y: 456, width: 34, height: 40, fill: '#f3e2b4' }, t);
-el('rect', { x: L, y: 560, width: Rr - L, height: 8, fill: '#b2231a' }, t); // stripe
-el('rect', { x: L + 14, y: 548, width: 812 - L, height: 4, fill: '#3a2b24' }, t); // handrail
-el('circle', { cx: L + 6, cy: 548, r: 9, fill: '#f3e2b4' }, t);         // headlight (front, leading the push)
-// red star on the cab
-const star = []; for (let k = 0; k < 10; k++) { const r = k % 2 ? 9 : 22, a = -Math.PI / 2 + k * Math.PI / 5; star.push(`${883 + r * Math.cos(a)},${530 + r * Math.sin(a)}`); }
-el('polygon', { points: star.join(' '), fill: '#c4321f' }, t);
-bogie(L + 70); bogie(Rr - 80);
+const wagon = (x, y, w, col) => {
+  el('rect', { x, y: y - 58, width: w, height: 46, rx: 3, fill: col, stroke: '#1a100c', 'stroke-width': 3, filter: 'url(#soft)' }, g);
+  for (let i = 1; i < 4; ++i) el('path', { d: `M${x + i * w / 4} ${y - 54} V${y - 16}`, stroke: '#1a100c', 'stroke-width': 2, opacity: .5 }, g);
+  for (const wx of [x + 18, x + 38, x + w - 38, x + w - 18]) el('circle', { cx: wx, cy: y - 8, r: 9, fill: '#241a16' }, g);
+};
+const tank = (x, y, w, col) => {
+  el('rect', { x: x + 4, y: y - 18, width: w - 8, height: 8, fill: '#241a16' }, g);
+  el('rect', { x, y: y - 60, width: w, height: 44, rx: 22, fill: col, stroke: '#1a100c', 'stroke-width': 3, filter: 'url(#soft)' }, g);
+  el('rect', { x: x + w / 2 - 12, y: y - 72, width: 24, height: 14, fill: col, stroke: '#1a100c', 'stroke-width': 3 }, g);
+  for (const wx of [x + 18, x + 38, x + w - 38, x + w - 18]) el('circle', { cx: wx, cy: y - 8, r: 9, fill: '#241a16' }, g);
+};
+const loco = (x, y, cabRight) => {
+  const w = 150;
+  el('rect', { x, y: y - 60, width: w, height: 48, rx: 4, fill: '#8a1a12', stroke: '#1a100c', 'stroke-width': 3, filter: 'url(#soft)' }, g);
+  const cx = cabRight ? x + w - 46 : x + 6;
+  el('rect', { x: cx, y: y - 92, width: 40, height: 36, rx: 3, fill: '#8a1a12', stroke: '#1a100c', 'stroke-width': 3 }, g);
+  el('rect', { x: cx + 7, y: y - 85, width: 26, height: 14, fill: '#9fc3d6' }, g);
+  el('rect', { x: x + 10, y: y - 40, width: w - 20, height: 7, fill: '#e3a93a' }, g);
+  el('path', { d: starPath(cabRight ? x + 40 : x + w - 40, y - 46, 9, .45), fill: '#e3a93a' }, g);
+  for (const wx of [x + 22, x + 46, x + w - 46, x + w - 22]) el('circle', { cx: wx, cy: y - 8, r: 10, fill: '#241a16' }, g);
+};
+
+// 1: wagons left standing on the upper track
+wagon(230, T1, 114, '#8f8676'); tank(352, T1, 114, '#3a2b24'); wagon(474, T1, 114, '#a5604a'); wagon(596, T1, 114, '#5a6b3a');
+
+// 2: the locomotive runs round them on the next track, onto the far end of the wagons
+loco(560, T2, true);
+el('path', { d: `M725 ${T2 - 50} H860 C910 ${T2 - 50} 930 ${T1 - 20} 900 ${T1 - 70} C880 ${T1 - 100} 830 ${T1 - 96} 760 ${T1 - 86}`,
+             fill: 'none', stroke: '#e3a93a', 'stroke-width': 8, 'stroke-dasharray': '18 10', 'stroke-linecap': 'round' }, g);
+el('path', { d: `M738 ${T1 - 84} l30 -18 l2 34 Z`, fill: '#e3a93a' }, g);
+
+// 3: a train reversing: the locomotive at the back pushes its wagons to the left
+wagon(222, T3, 114, '#5a6b3a'); wagon(344, T3, 114, '#8f8676'); tank(466, T3, 114, '#3a2b24'); wagon(588, T3, 114, '#a5604a');
+loco(710, T3, true);
+el('path', { d: `M206 ${T3 - 36} H90`, stroke: '#f3e2b4', 'stroke-width': 10, 'stroke-linecap': 'round' }, g);
+el('path', { d: `M60 ${T3 - 36} l34 -22 v44 Z`, fill: '#f3e2b4' }, g);
 </script>
 </body></html>

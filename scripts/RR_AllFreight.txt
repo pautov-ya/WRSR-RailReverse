@@ -1,4 +1,4 @@
-// Rail Reverse - all freight trains: on / off.
+// Rail Operations - all freight trains: on / off.
 // The plugin switches the freight trains on while RR_AllFreightOn.txt is running;
 // this button starts or stops it. The running script is kept in the save.
 
