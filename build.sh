@@ -25,7 +25,7 @@ if [ "$1" = "dev" ]; then
   # The game keeps a local item (and its Scripts menu buttons) only when its
   # $ITEM_ID is the folder's number (FUN_14083f870) and $OWNER_ID the player
   # (FUN_1408407c0). Never uploaded: VISIBILITY 2, no such Workshop item.
-  owner=$(grep -E '^\$OWNER_ID' workshopconfig.ini)
+  owner=$(grep -hE '^\$OWNER_ID' workshopconfig.ini "$PROJECT/workshopconfig.ini" 2>/dev/null | head -n 1)
   printf '%s\n\n' '$ITEM_ID 9784150' "$owner" '$ITEM_TYPE WORKSHOP_ITEMTYPE_SCRIPT' '$VISIBILITY 2' \
     '$ITEM_NAME "Rail Operations (dev)"' '$ITEM_DESC "Development build, not for upload."' '$END' > "$DEV/workshopconfig.ini"
   rm -f "$DEV"/RR_All*.txt "$DEV"/RR_All*.png "$DEV"/SOVIETInstructions.txt
@@ -36,16 +36,20 @@ if [ "$1" = "dev" ]; then
 fi
 
 mkdir -p "$PROJECT/plugins"
-# The game writes $ITEM_ID/$OWNER_ID into the project's workshopconfig.ini on the
-# first upload. Keep them, or the next upload would publish a new Workshop item.
-ids=$(grep -E '^\$(ITEM_ID|OWNER_ID)' "$PROJECT/workshopconfig.ini" 2>/dev/null || true)
-if [ -n "$ids" ] && ! grep -q '^\$ITEM_ID' workshopconfig.ini; then
-  { printf '%s\n\n' "$ids"; cat workshopconfig.ini; } > "$PROJECT/workshopconfig.ini.new"
-  mv -f "$PROJECT/workshopconfig.ini.new" "$PROJECT/workshopconfig.ini"
-else
-  cp -f workshopconfig.ini "$PROJECT/workshopconfig.ini"
+# The Steam page (workshopconfig.ini, art/previewimage.png) lives on the local
+# steam branch; on main the item keeps the files it already has.
+if [ -f workshopconfig.ini ]; then
+  # The game writes $ITEM_ID/$OWNER_ID into the project's workshopconfig.ini on the
+  # first upload. Keep them, or the next upload would publish a new Workshop item.
+  ids=$(grep -E '^\$(ITEM_ID|OWNER_ID)' "$PROJECT/workshopconfig.ini" 2>/dev/null || true)
+  if [ -n "$ids" ] && ! grep -q '^\$ITEM_ID' workshopconfig.ini; then
+    { printf '%s\n\n' "$ids"; cat workshopconfig.ini; } > "$PROJECT/workshopconfig.ini.new"
+    mv -f "$PROJECT/workshopconfig.ini.new" "$PROJECT/workshopconfig.ini"
+  else
+    cp -f workshopconfig.ini "$PROJECT/workshopconfig.ini"
+  fi
+  cp -f art/previewimage.png "$PROJECT/previewimage.png"
 fi
-cp -f art/previewimage.png "$PROJECT/previewimage.png"
 # the Scripts menu buttons sit in the item's root, the icons next to the dll
 cp -f scripts/* "$PROJECT/"
 cp -f build/railreverse.dll build/railreverse.ini art/button_*.png "$PROJECT/plugins/"
