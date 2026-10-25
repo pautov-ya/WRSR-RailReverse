@@ -19,7 +19,7 @@
 #include <wchar.h>
 #include <shlwapi.h>
 
-#define RR_VERSION "0.4.3"
+#define RR_VERSION "0.5.0"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -119,7 +119,7 @@ static const short SIG_ROOM_B[] = {
 
 // The highest hub limit the keys reach: ini hub_limit_max, 1 ... 255 (it is
 // kept in 8 bits of a train's flags in railreverse.txt).
-#define HUB_LIMIT_DEFAULT_MAX 25
+#define HUB_LIMIT_DEFAULT_MAX 20
 #define HUB_LIMIT_CEILING     255
 
 // The game's list of every vehicle, in save order: vehicles.bin is written by
@@ -161,8 +161,6 @@ static BYTE***  g_vehicles;       // &vector.begin; end is the next qword
 struct Key { int vk; int ctrl, shift, alt; char label[32]; };
 
 static struct {
-    int   allFreightDefault;    // the switches a save without our file starts with
-    int   allPassengerDefault;
     float pushKmh;          // speed cap while pushing, 0 = none
     float lightKmh;         // speed cap for a locomotive running backwards on its own, 0 = none
     int   skipBothEnds;     // a locomotive at the far end too: leave the train alone
@@ -173,12 +171,17 @@ static struct {
     float indicatorX, indicatorY;   // offset from that corner, % of the screen width / height
     int   fontScale;        // indicator font, % of the default UI font
     int   outline;          // outline width, px
-    Key   keyTrain, keyFreight, keyPassenger, keyLimitUp, keyLimitDown, keyLimitReset;
+    int   windowButtons;    // the two buttons in the train window
+    float buttonX, buttonY; // their place: centre of the upper one, game units (x 1 at 100 % UI scale) from the window's corner
+    Key   keyTrain, keyLimitUp, keyLimitDown, keyLimitReset;
 } cfg;
 
 // A train pushes after a reversal if it was chosen in its window, or if every
 // train of its class (freight / passenger) is switched on.
-static volatile LONG g_allFreight, g_allPassenger;
+static volatile LONG g_allFreight, g_allPassenger;   // from the Scripts menu flags (ScriptFlags)
+static int g_allForced;                 // no train window to switch anything in: every train reverses
+static volatile LONG g_iconsStale;      // a save was loaded: the game let go of the textures it had
+static volatile LONG g_flagsStale = 1;  // a save was loaded: the Scripts menu flags are read afresh
 
 static bool ParseKey(const char* s, Key* k)
 {
@@ -434,7 +437,7 @@ static bool IsPassengerTrain(BYTE* lead)
     return false;
 }
 
-static bool ClassOn(BYTE* lead) { return IsPassengerTrain(lead) ? g_allPassenger != 0 : g_allFreight != 0; }
+static bool ClassOn(BYTE* lead) { return g_allForced || (IsPassengerTrain(lead) ? g_allPassenger != 0 : g_allFreight != 0); }
 
 static bool LocoAtBothEnds(BYTE* lead)
 {
@@ -635,8 +638,7 @@ static void SaveSidecar(const char* vehiclesBin)
     BYTE** veh = 0;
     int n = VehicleCount(&veh);
     static char buf[512 * (TYPE_NAME_MAX + 24) + 64];
-    int len = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "freight %d\npassenger %d\n",
-                          g_allFreight ? 1 : 0, g_allPassenger ? 1 : 0);
+    int len = 0;
     int trains = 0;
     EnterCriticalSection(&g_lock);
     for (int i = 0; i < n && trains < 512; ++i) {
@@ -655,7 +657,7 @@ static void SaveSidecar(const char* vehiclesBin)
         ++trains;
     }
     LeaveCriticalSection(&g_lock);
-    if (!trains && (int)g_allFreight == cfg.allFreightDefault && (int)g_allPassenger == cfg.allPassengerDefault) {
+    if (!trains) {
         DeleteFileA(path);                // nothing to remember: no stale file for the next load
         Logf("railreverse  save: nothing to remember");
         return;
@@ -665,8 +667,7 @@ static void SaveSidecar(const char* vehiclesBin)
     DWORD wrote = 0;
     WriteFile(h, buf, (DWORD)len, &wrote, 0);
     CloseHandle(h);
-    Logf("railreverse  save: all freight %d, all passenger %d, %d train(s) -> %s",
-         g_allFreight ? 1 : 0, g_allPassenger ? 1 : 0, trains, path);
+    Logf("railreverse  save: %d train(s) -> %s", trains, path);
 }
 
 static void LoadSidecar(const char* vehiclesBin)
@@ -678,8 +679,9 @@ static void LoadSidecar(const char* vehiclesBin)
     g_anyPushing = 0;
     g_pendingCount = 0;
     g_pendingLive = 0;
-    g_allFreight = cfg.allFreightDefault;
-    g_allPassenger = cfg.allPassengerDefault;
+    g_allFreight = g_allPassenger = 0;               // until the Scripts menu flags are read
+    g_iconsStale = 1;
+    g_flagsStale = 1;
     LeaveCriticalSection(&g_lock);
 
     char path[MAX_PATH * 2];
@@ -698,10 +700,8 @@ static void LoadSidecar(const char* vehiclesBin)
         if (end) *end = 0;
         size_t k = strlen(line);
         if (k && line[k - 1] == '\r') line[k - 1] = 0;
-        if (!strncmp(line, "freight ", 8)) {
-            g_allFreight = atoi(line + 8) != 0;
-        } else if (!strncmp(line, "passenger ", 10)) {
-            g_allPassenger = atoi(line + 10) != 0;
+        if (!strncmp(line, "freight ", 8) || !strncmp(line, "passenger ", 10)) {
+            // 0.4: the class switches were kept here; now the Scripts menu has them
         } else if (g_pendingCount < 512) {
             char* a = strchr(line, ' ');
             char* b = a ? strchr(a + 1, ' ') : 0;
@@ -719,8 +719,7 @@ static void LoadSidecar(const char* vehiclesBin)
     g_pendingTries = 0;
     g_pendingLive = g_pendingCount;
     LeaveCriticalSection(&g_lock);
-    Logf("railreverse  load: all freight %d, all passenger %d, %d train(s) to restore from %s",
-         g_allFreight ? 1 : 0, g_allPassenger ? 1 : 0, g_pendingCount, path);
+    Logf("railreverse  load: %d train(s) to restore from %s", g_pendingCount, path);
 }
 
 // Runs from the placement hook, i.e. once the world is drawn, until every
@@ -980,7 +979,7 @@ static void HookXform(BYTE* v, float* pos, float yaw, float pitch)
 }
 
 // ---------------------------------------------------------------- train window
-static int g_latchTrain, g_latchFreight, g_latchPassenger, g_latchUp, g_latchDown, g_latchReset;
+static int g_latchTrain, g_latchUp, g_latchDown, g_latchReset;
 
 // The game's fonts: every global the game passes as the font to a
 // C3D_FONTMANAGER::Print* import (found at start). The indicator uses the one
@@ -1133,6 +1132,9 @@ static void ReloadIndicatorSettings(void)
     if (a != cfg.anchor || x != cfg.indicatorX || y != cfg.indicatorY || s != cfg.fontScale || o != cfg.outline)
         Logf("railreverse  indicator: %s, x %.2f%%, y %.2f%%, font scale %d%%, outline %d", kAnchors[a], x, y, s, o);
     cfg.anchor = a; cfg.indicatorX = x; cfg.indicatorY = y; cfg.fontScale = s; cfg.outline = o;
+    float bx = ConfigFloat("window_button_x", cfg.buttonX), by = ConfigFloat("window_button_y", cfg.buttonY);
+    if (bx != cfg.buttonX || by != cfg.buttonY) Logf("railreverse  train window buttons at %.0f, %.0f", bx, by);
+    cfg.buttonX = bx; cfg.buttonY = by;
     PickFont();
 }
 
@@ -1196,8 +1198,8 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned, int limit
     KeyText(&cfg.keyLimitDown, kD, 40);
     KeyText(&cfg.keyLimitReset, kR, 40);
     KeyText(&cfg.keyTrain, kT, 40);
-    KeyText(&cfg.keyFreight, kF, 40);
-    KeyText(&cfg.keyPassenger, kP, 40);
+    wcscpy(kF, T == &kRussian ? L"меню Скрипты" : L"Scripts menu");
+    wcscpy(kP, kF);
     // What is on the screen, from how the train is drawn: mirrored puts the
     // locomotive at the back, turned round faces its cab the other way, so
     // the cab faces the way of travel when both or neither apply.
@@ -1246,6 +1248,186 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned, int limit
     for (int i = 0; i < 4; ++i) Text(x, y + i * lineH, colors[i], lines[i]);
 }
 
+// ---------------------------------------------------------------- train window buttons
+// Two buttons below the game's signal button, drawn and clicked the way the
+// game does its own (same panel, so they are clipped and scrolled with the
+// window): reversing for this train (as key_train) and the most wagons a
+// supply base hands it (left click +1, right click -1, round in a ring like
+// the keys). The icons sit next to the dll.
+#define RVA_INPUT      0xA54B90   // C3D_INPUT
+#define RVA_CLICK      0xA54E91   // u8: a left click this frame, cleared by whoever takes it
+#define RVA_RCLICK     0xA54E93   // u8: a right click (0xA54E90/91 left down/click, 92/93 right)
+#define RVA_PANEL      0x9BE060   // the C3D_PANEL2D the windows draw their buttons with
+#define RVA_PANEL_SIZE 0x9BE2E8   // float w, h
+#define RVA_PANEL_POS  0x9BE2F0   // float x, y; then a dword 0
+#define RVA_PANEL_RGBA 0x9BE30C   // float r, g, b, a
+#define RVA_SAMPLER    0x9EAD08   // what a texture is bound with
+#define RVA_MIDDLE     0x9EACD0   // C3D_MIDDLEPOINT: makes textures
+#define UI_TOOLTIP     0xD5A0     // ui: wchar_t tooltip of what is under the mouse
+#define W_ACTIVE       0x20       // u8: the window takes the mouse
+#define EXP_MOUSE      "?GetMouseSolid@C3D_INPUT@@QEAA?AVC3DVECTOR3@@XZ"
+#define EXP_TEXTURE    "?CreateManagedTexture@C3D_MIDDLEPOINT@@QEAAPEAVC3DAPI_TEXTURE@@PEBD@Z"
+#define EXP_DRAW       "?Draw@C3D_PANEL2D@@QEAAXMMMMM_N@Z"
+typedef float* (*FnMouse)(void* input, float* out);
+typedef void* (*FnTexture)(void* middle, const char* name);
+typedef int (*FnLoad)(void* tex, const char* path, int w, int h, unsigned mips, int format);
+typedef void (*FnBind)(void* tex, int slot, void* sampler);
+typedef void (*FnDraw)(void* panel, float u0, float v0, float u1, float v1, float rot, bool blend);
+static FnMouse   g_mouse;
+static FnTexture g_texture;
+static FnDraw    g_panelDraw;
+#define ICONS 4
+static void*     g_icons[ICONS];   // push off, on; limit off, on
+#define ICON_PUSH  0
+#define ICON_LIMIT 2
+
+// Loaded the way the game loads its buttons, by a path relative to media_soviet.
+static bool LoadIcons(void)
+{
+    static int tried;
+    if (InterlockedExchange(&g_iconsStale, 0)) {
+        tried = 0;
+        for (int i = 0; i < ICONS; ++i) g_icons[i] = 0;
+    }
+    if (tried++) {
+        for (int i = 0; i < ICONS; ++i) if (!g_icons[i]) return false;
+        return true;
+    }
+    char dir[MAX_PATH] = "";
+    HMODULE self = 0;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&LoadIcons, &self);
+    DWORD n = GetModuleFileNameA(self, dir, MAX_PATH);
+    while (n && dir[n - 1] != '\\' && dir[n - 1] != '/') --n;
+    dir[n] = 0;
+    const char* names[ICONS] = { "button_push_off.png", "button_push_on.png", "button_limit_off.png", "button_limit_on.png" };
+    for (int i = 0; i < ICONS; ++i) {
+        char path[MAX_PATH], full[MAX_PATH], media[MAX_PATH];
+        _snprintf_s(full, sizeof(full), _TRUNCATE, "%s%s", dir, names[i]);
+        DWORD m = GetModuleFileNameA(0, media, MAX_PATH);
+        while (m && media[m - 1] != '\\') --m;
+        _snprintf_s(media + m, sizeof(media) - m, _TRUNCATE, "media_soviet");
+        if (!PathRelativePathToA(path, media, FILE_ATTRIBUTE_DIRECTORY, full, 0)) strcpy(path, full);
+        for (char* c = path; *c; ++c) if (*c == '\\') *c = '/';
+        if (path[0] == '.' && path[1] == '/') memmove(path, path + 2, strlen(path + 2) + 1);
+        void* tex = g_texture(g_exeBase + RVA_MIDDLE, path);
+        int err = tex ? ((FnLoad)(*(void***)tex)[2])(tex, path, 0, 0, 1, 0) : -1;   // 0: loaded (the game checks != 0)
+        if (err) Logf("railreverse  icon %s not loaded (%d)", path, err);
+        g_icons[i] = err ? 0 : tex;
+    }
+    for (int i = 0; i < ICONS; ++i) if (!g_icons[i]) return false;
+    return true;
+}
+
+static void DrawIcon(void* tex, float x, float y, float size, float alpha)
+{
+    ((FnBind)(*(void***)tex)[0x70 / 8])(tex, 0, *(void**)(g_exeBase + RVA_SAMPLER));
+    float* sz = (float*)(g_exeBase + RVA_PANEL_SIZE);
+    float* at = (float*)(g_exeBase + RVA_PANEL_POS);
+    float* rgba = (float*)(g_exeBase + RVA_PANEL_RGBA);
+    sz[0] = sz[1] = size;
+    at[0] = x; at[1] = y; *(int*)(at + 2) = 0;
+    rgba[0] = rgba[1] = rgba[2] = 1.0f;
+    rgba[3] = alpha;
+    g_panelDraw(g_exeBase + RVA_PANEL, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, true);
+}
+
+static bool Hover(BYTE* window, float x, float y, float size)
+{
+    float m[3] = { 0, 0, 0 };
+    g_mouse(g_exeBase + RVA_INPUT, m);
+    return *(window + W_ACTIVE) && fabsf(m[0] - x) <= size / 2 && fabsf(m[1] - y) <= size / 2;
+}
+
+static void Tooltip(BYTE* ui, const wchar_t* tip)
+{
+    wcsncpy((wchar_t*)(ui + UI_TOOLTIP), tip, 160);
+    ((wchar_t*)(ui + UI_TOOLTIP))[159] = 0;
+}
+
+// The wagon limit one step up or down, round in a ring: no limit -> 1 -> ...
+// -> hub_limit_max -> no limit (keys and the button alike).
+static int StepLimit(int limit, int step)
+{
+    if (step > 0) return limit >= cfg.hubLimitMax ? 0 : limit + 1;
+    return limit <= 0 ? cfg.hubLimitMax : limit - 1;
+}
+
+static void WindowButtons(BYTE* ui, BYTE* window, BYTE* lead)
+{
+    if (!LoadIcons()) return;
+    ReloadIndicatorSettings();
+    float sc = 1.0f, wx = 0, wy = 0, ox = 0, oy = 0;
+    Rd(g_exeBase, RVA_UI_SCALE, &sc);
+    if (!(sc > 0.25f && sc < 8.0f)) sc = 1.0f;
+    if (!Rd(window, W_POS_X, &wx) || !Rd(window, W_POS_Y, &wy) || !Rd(window, W_OFF_X, &ox) || !Rd(window, W_OFF_Y, &oy)) return;
+    float size = sc * 50.0f, x = wx + ox + sc * cfg.buttonX, y1 = wy + oy + sc * cfg.buttonY, y2 = y1 + sc * 52.0f;
+    bool ru = T == &kRussian;
+
+    EnterCriticalSection(&g_lock);
+    Train* t = Current(lead, false);
+    int chosen = t ? t->chosen : 0, limit = t ? t->hubLimit : 0;
+    LeaveCriticalSection(&g_lock);
+
+    // green while this train reverses: its own switch, or all trains of its class (Scripts menu)
+    bool passenger = IsPassengerTrain(lead);
+    bool classOn = passenger ? g_allPassenger != 0 : g_allFreight != 0;
+    bool h1 = Hover(window, x, y1, size), h2 = Hover(window, x, y2, size);
+    DrawIcon(g_icons[ICON_PUSH + (chosen || classOn ? 1 : 0)], x, y1, size, h1 ? 1.0f : 0.8f);
+    DrawIcon(g_icons[ICON_LIMIT + (limit ? 1 : 0)], x, y2, size, h2 ? 1.0f : 0.8f);
+    if (limit && g_font) {
+        wchar_t n[8];
+        _snwprintf_s(n, 8, _TRUNCATE, L"%d", limit);
+        float tw = (float)wcslen(n) * g_fontPx * 0.55f;
+        Text(x - tw / 2, y2 - size * 0.42f, 0xFF289628u, n);
+    }
+    if (!h1 && !h2) return;
+
+    BYTE* click = g_exeBase + RVA_CLICK;
+    BYTE* rclick = g_exeBase + RVA_RCLICK;
+    wchar_t tip[160];
+    if (h1) {
+        wchar_t kTrain[40];
+        KeyText(&cfg.keyTrain, kTrain, 40);
+        _snwprintf_s(tip, 160, _TRUNCATE,
+                     ru ? L"Реверс выбранного поезда: %ls\r\nЛокомотив толкает вагоны задним ходом.\r\nНажмите, чтобы %ls (%ls)\r\nВсе %ls: %ls (меню Скрипты)"
+                        : L"Reversing for the selected train: %ls\r\nThe locomotive pushes its wagons backwards.\r\nClick to switch %ls (%ls)\r\nAll %ls trains: %ls (Scripts menu)",
+                     chosen ? (ru ? L"ВКЛ." : L"ON") : (ru ? L"выкл." : L"off"),
+                     chosen ? (ru ? L"выключить" : L"off") : (ru ? L"включить" : L"on"), kTrain,
+                     passenger ? (ru ? L"пассажирские" : L"passenger") : (ru ? L"грузовые" : L"freight"),
+                     classOn ? (ru ? L"вкл." : L"on") : (ru ? L"выкл." : L"off"));
+        Tooltip(ui, tip);
+        if (*click) {
+            *click = 0;                                    // taken: nothing under the window gets it
+            EnterCriticalSection(&g_lock);
+            if (Train* c = Current(lead, true)) chosen = c->chosen = !c->chosen;
+            LeaveCriticalSection(&g_lock);
+            Logf("railreverse  train %p: reversing %s (button)", lead, chosen ? "ON" : "off");
+        }
+        return;
+    }
+    wchar_t now[40], kReset[40];
+    KeyText(&cfg.keyLimitReset, kReset, 40);
+    if (limit) _snwprintf_s(now, 40, _TRUNCATE, ru ? L"не больше %d" : L"at most %d", limit);
+    else wcscpy(now, ru ? L"без ограничения" : L"no limit");
+    _snwprintf_s(tip, 160, _TRUNCATE,
+                 ru ? L"Вагоны с базы снабжения: %ls\r\nЛевый клик +1, правый -1\r\nСброс на «без ограничения»: %ls"
+                    : L"Wagons from a supply base: %ls\r\nLeft click +1, right click -1\r\nBack to no limit: %ls",
+                 now, kReset);
+    Tooltip(ui, tip);
+    int step = *click ? 1 : *rclick ? -1 : 0;
+    if (!step) return;
+    *click = 0;
+    *rclick = 0;
+    EnterCriticalSection(&g_lock);
+    if (Train* c = Current(lead, true)) {
+        c->hubLimit = StepLimit(c->hubLimit, step);
+        limit = c->hubLimit;
+    }
+    LeaveCriticalSection(&g_lock);
+    Logf("railreverse  train %p: hub limit %d%s (button)", lead, limit, limit ? " wagons" : " (none)");
+}
+
 static void TrainWindow(BYTE* ui, BYTE* window, FnPanel orig)
 {
     BYTE* lead = 0;
@@ -1269,28 +1451,23 @@ static void TrainWindow(BYTE* ui, BYTE* window, FnPanel orig)
         // The combinations share keys, so each is matched exactly (modifiers
         // included): CTRL+SHIFT+F9 never also counts as CTRL+F9.
         bool toggleTrain     = Pressed(&cfg.keyTrain, &g_latchTrain);
-        bool toggleFreight   = Pressed(&cfg.keyFreight, &g_latchFreight);
-        bool togglePassenger = Pressed(&cfg.keyPassenger, &g_latchPassenger);
         bool limitUp         = Pressed(&cfg.keyLimitUp, &g_latchUp);
         bool limitDown       = Pressed(&cfg.keyLimitDown, &g_latchDown);
         bool limitReset      = Pressed(&cfg.keyLimitReset, &g_latchReset);
         EnterCriticalSection(&g_lock);
-        if (toggleFreight)   g_allFreight = !g_allFreight;
-        if (togglePassenger) g_allPassenger = !g_allPassenger;
         Train* t = Current(lead, toggleTrain || limitUp || limitDown || limitReset);
         if (t && toggleTrain) t->chosen = !t->chosen;
-        if (t && limitUp && t->hubLimit < cfg.hubLimitMax) ++t->hubLimit;   // "no limit" -> 1 -> ... -> hub_limit_max
-        if (t && limitDown && t->hubLimit > 1) --t->hubLimit;               // 10 -> ... -> 1, stops at 1
+        if (t && limitUp)   t->hubLimit = StepLimit(t->hubLimit, 1);
+        if (t && limitDown) t->hubLimit = StepLimit(t->hubLimit, -1);
         if (t && limitReset) t->hubLimit = 0;                              // "no limit"
         if (t) { chosen = t->chosen; pushing = t->pushing; turned = t->turned; limit = t->hubLimit; }
         LeaveCriticalSection(&g_lock);
         if (toggleTrain)     Logf("railreverse  train %p: reversing %s", lead, chosen ? "ON" : "off");
-        if (toggleFreight)   Logf("railreverse  all freight trains: %s", g_allFreight ? "ON" : "off");
-        if (togglePassenger) Logf("railreverse  all passenger trains: %s", g_allPassenger ? "ON" : "off");
         if (limitUp || limitDown || limitReset) Logf("railreverse  train %p: hub limit %d%s", lead, limit, limit ? " wagons" : " (none)");
     }
 
     orig(ui, window);
+    if (lead && cfg.windowButtons) WindowButtons(ui, window, lead);
     if (lead) {
         g_shown.lead = lead; g_shown.chosen = chosen; g_shown.pushing = pushing; g_shown.turned = turned;
         g_shown.limit = limit;
@@ -1301,9 +1478,66 @@ static void TrainWindow(BYTE* ui, BYTE* window, FnPanel orig)
 static void HookWindow(BYTE* ui, BYTE* window) { TrainWindow(ui, window, g_origWindow); }
 static void HookPanel(BYTE* ui, BYTE* window)  { TrainWindow(ui, window, g_origPanel); }
 
+// ---------------------------------------------------------------- Scripts menu
+// "All freight" / "all passenger" are switched only in the Scripts menu
+// (Options -> Scripts): its two buttons of this mod, RR_AllFreight /
+// RR_AllPassenger, start or stop a script that only sleeps,
+// RR_AllFreightOn.txt / RR_AllPassengerOn.txt; a class reverses while its
+// flag runs. Running scripts are kept in the save (runningScripts.bin,
+// FUN_14059a4a0): world +0x13BB8, a vector of script*, each with two wide
+// strings at *(+0xB8) and *(+0xC0) (its file and name, FUN_140598890).
+#define RVA_WORLD        0x9D4F10
+#define WORLD_SCRIPTS    0x13BB8
+#define FLAG_FREIGHT     L"RR_AllFreightOn"
+#define FLAG_PASSENGER   L"RR_AllPassengerOn"
+
+static bool ScriptNamed(BYTE* script, const wchar_t* name)
+{
+    static const size_t at[2] = { 0xB8, 0xC0 };
+    for (int i = 0; i < 2; ++i) {
+        wchar_t* p = 0;
+        wchar_t buf[200];
+        size_t n = 0;
+        if (!Rd(script, at[i], &p) || !p) continue;
+        while (n + 1 < 200 && ReadablePtr(p + n, 2) && p[n]) buf[n] = p[n], ++n;
+        buf[n] = 0;
+        if (wcsstr(buf, name)) return true;
+    }
+    return false;
+}
+
+static void ScriptFlags(void)
+{
+    static DWORD last;
+    static int freightWas = -1, passengerWas = -1;      // -1: not logged since the load
+    DWORD now = GetTickCount();
+    if (now - last < 500) return;
+    last = now;
+    if (InterlockedExchange(&g_flagsStale, 0)) freightWas = passengerWas = -1;
+    BYTE *b = 0, *e = 0;
+    BYTE* world = g_exeBase + RVA_WORLD;
+    if (!Rd(world, WORLD_SCRIPTS, &b) || !Rd(world, WORLD_SCRIPTS + 8, &e) || (b && e < b) || e - b > 8 * 4096) return;
+    int n = b ? (int)((e - b) / 8) : 0;
+    if (n && !ReadablePtr(b, (size_t)n * 8)) return;
+    int freight = 0, passenger = 0;
+    for (int i = 0; i < n; ++i) {
+        BYTE* sc = ((BYTE**)b)[i];
+        if (!sc) continue;
+        if (ScriptNamed(sc, FLAG_FREIGHT)) freight = 1;
+        else if (ScriptNamed(sc, FLAG_PASSENGER)) passenger = 1;
+    }
+    g_allFreight = freight;
+    g_allPassenger = passenger;
+    if (freight != freightWas) Logf("railreverse  all freight trains: %s (Scripts menu)", freight ? "ON" : "off");
+    if (passenger != passengerWas) Logf("railreverse  all passenger trains: %s (Scripts menu)", passenger ? "ON" : "off");
+    freightWas = freight;
+    passengerWas = passenger;
+}
+
 // FUN_1406e9b80(ui): draws every open info window.
 static void HookDispatch(BYTE* ui)
 {
+    ScriptFlags();
     unsigned pass = ++g_pass;
     g_origDispatch(ui);
     if (g_shown.lead && g_shown.pass == pass) Indicator(g_shown.lead, g_shown.chosen, g_shown.pushing, g_shown.turned, g_shown.limit);
@@ -1427,10 +1661,6 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
         return 1;                       // nothing hooked, safe to unload
     }
     char s[64];
-    cfg.allFreightDefault   = H->configInt(RR_INI, "railreverse", "all_freight", 0) != 0;
-    cfg.allPassengerDefault = H->configInt(RR_INI, "railreverse", "all_passenger", 0) != 0;
-    g_allFreight   = cfg.allFreightDefault;
-    g_allPassenger = cfg.allPassengerDefault;
     cfg.pushKmh      = (float)H->configInt(RR_INI, "railreverse", "push_speed_kmh", 25);
     cfg.lightKmh     = (float)H->configInt(RR_INI, "railreverse", "light_engine_speed_kmh", 0);
     cfg.skipBothEnds = H->configInt(RR_INI, "railreverse", "skip_loco_both_ends", 1);
@@ -1438,7 +1668,10 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     if (cfg.hubLimitMax < 1) cfg.hubLimitMax = 1;
     if (cfg.hubLimitMax > HUB_LIMIT_CEILING) cfg.hubLimitMax = HUB_LIMIT_CEILING;
     cfg.logFlips     = H->configInt(RR_INI, "railreverse", "log_flips", 1);
-    cfg.indicator    = H->configInt(RR_INI, "railreverse", "indicator", 1);
+    cfg.indicator    = H->configInt(RR_INI, "railreverse", "indicator", 0);
+    cfg.windowButtons = H->configInt(RR_INI, "railreverse", "window_buttons", 1);
+    cfg.buttonX      = ConfigFloat("window_button_x", 570.0f);
+    cfg.buttonY      = ConfigFloat("window_button_y", 24.0f);
     cfg.anchor       = ConfigAnchor(ANCHOR_BOTTOM_LEFT);
     cfg.indicatorX   = ConfigFloat("indicator_x", 0.6f);
     cfg.indicatorY   = ConfigFloat("indicator_y", 0.0f);
@@ -1447,19 +1680,13 @@ extern "C" __declspec(dllexport) int TsmPluginInit(const TsmHost* host, TsmPlugi
     cfg.outline      = H->configInt(RR_INI, "railreverse", "indicator_outline", 1);
     H->configString(RR_INI, "railreverse", "key_train", s, sizeof(s), "CTRL+F9");
     if (!ParseKey(s, &cfg.keyTrain)) { Logf("railreverse  key_train \"%s\" not understood, using CTRL+F9", s); ParseKey("CTRL+F9", &cfg.keyTrain); }
-    H->configString(RR_INI, "railreverse", "key_all_freight", s, sizeof(s), "CTRL+SHIFT+F9");
-    if (!ParseKey(s, &cfg.keyFreight)) { Logf("railreverse  key_all_freight \"%s\" not understood, using CTRL+SHIFT+F9", s); ParseKey("CTRL+SHIFT+F9", &cfg.keyFreight); }
-    H->configString(RR_INI, "railreverse", "key_all_passenger", s, sizeof(s), "CTRL+ALT+F9");
-    if (!ParseKey(s, &cfg.keyPassenger)) { Logf("railreverse  key_all_passenger \"%s\" not understood, using CTRL+ALT+F9", s); ParseKey("CTRL+ALT+F9", &cfg.keyPassenger); }
     H->configString(RR_INI, "railreverse", "key_hub_limit_up", s, sizeof(s), "CTRL+PLUS");
     if (!ParseKey(s, &cfg.keyLimitUp)) { Logf("railreverse  key_hub_limit_up \"%s\" not understood, using CTRL+PLUS", s); ParseKey("CTRL+PLUS", &cfg.keyLimitUp); }
     H->configString(RR_INI, "railreverse", "key_hub_limit_down", s, sizeof(s), "CTRL+MINUS");
     if (!ParseKey(s, &cfg.keyLimitDown)) { Logf("railreverse  key_hub_limit_down \"%s\" not understood, using CTRL+MINUS", s); ParseKey("CTRL+MINUS", &cfg.keyLimitDown); }
     H->configString(RR_INI, "railreverse", "key_hub_limit_reset", s, sizeof(s), "CTRL+SHIFT+MINUS");
     if (!ParseKey(s, &cfg.keyLimitReset)) { Logf("railreverse  key_hub_limit_reset \"%s\" not understood, using CTRL+SHIFT+MINUS", s); ParseKey("CTRL+SHIFT+MINUS", &cfg.keyLimitReset); }
-    Logf("railreverse  v%s init: all freight %d, all passenger %d, push speed %.0f km/h, keys %s / %s / %s",
-         RR_VERSION, cfg.allFreightDefault, cfg.allPassengerDefault, cfg.pushKmh,
-         cfg.keyTrain.label, cfg.keyFreight.label, cfg.keyPassenger.label);
+    Logf("railreverse  v%s init: push speed %.0f km/h, key %s", RR_VERSION, cfg.pushKmh, cfg.keyTrain.label);
     return 0;
 }
 
@@ -1534,6 +1761,14 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     // missing piece leaves the game untouched instead of half-patched.
     g_sample = (FnSample)FindUnique(SIG(SIG_SAMPLE));
     g_rotXY  = (FnRotXY)GetProcAddress(g_engine, EXP_ROTXY);
+    // drawing and clicking buttons the way the game's windows do
+    g_mouse = (FnMouse)GetProcAddress(g_engine, EXP_MOUSE);
+    g_texture = (FnTexture)GetProcAddress(g_engine, EXP_TEXTURE);
+    g_panelDraw = (FnDraw)GetProcAddress(g_engine, EXP_DRAW);
+    if (!g_mouse || !g_texture || !g_panelDraw) {
+        cfg.windowButtons = 0;
+        Logf("railreverse  train window buttons unavailable (engine exports missing)");
+    }
     if (!g_sample || !g_rotXY || !FindUnique(SIG(SIG_FLIP)) || !FindUnique(SIG(SIG_XFORM))) {
         Logf("railreverse  %s not found - nothing hooked",
              !g_sample ? "trail sampler" : !g_rotXY ? "C3DVec3GetRotationXY" : "flip or placement signature");
@@ -1550,7 +1785,7 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
     bool tabs   = Hook(SIG(SIG_VPANEL), VPANEL_STOLEN, (void*)HookPanel, (void**)&g_origPanel, "train window tabs 9-10");
     if (!window && !tabs) {
         Logf("railreverse  no train window: hotkeys unavailable, every train reverses");
-        g_allFreight = g_allPassenger = cfg.allFreightDefault = cfg.allPassengerDefault = 1;
+        g_allForced = 1;
     }
     if (!FindFont()) {
         g_print = 0;

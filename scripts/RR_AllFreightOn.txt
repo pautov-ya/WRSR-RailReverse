@@ -1,0 +1,16 @@
+// Rail Reverse - flag: while this script runs, all freight trains reverse.
+// It does nothing else.
+
+include("SOVIETInstructions.txt");
+
+defineVariable(char, bRun);
+
+defineFunction(main, void)
+{
+	bRun = 1;
+	while (bRun)
+	{
+		Script_Sleep(60.0);
+	}
+	end();
+}

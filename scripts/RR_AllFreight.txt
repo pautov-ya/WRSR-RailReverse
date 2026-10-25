@@ -1,0 +1,15 @@
+// Rail Reverse - all freight trains: on / off.
+// The plugin switches the freight trains on while RR_AllFreightOn.txt is running;
+// this button starts or stops it. The running script is kept in the save.
+
+include("SOVIETInstructions.txt");
+
+defineVariable(char, bOn);
+
+defineFunction(main, void)
+{
+	Script_Exists("RR_AllFreightOn.txt", bOn);
+	if (bOn) { Script_DestroyByName("RR_AllFreightOn.txt"); }
+	if (!bOn) { Script_StartNew("RR_AllFreightOn.txt"); }
+	end();
+}

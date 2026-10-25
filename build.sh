@@ -27,5 +27,7 @@ else
   cp -f workshopconfig.ini "$PROJECT/workshopconfig.ini"
 fi
 cp -f art/previewimage.png "$PROJECT/previewimage.png"
-cp -f build/railreverse.dll build/railreverse.ini "$PROJECT/plugins/"
+# the Scripts menu buttons sit in the item's root, the icons next to the dll
+cp -f scripts/* "$PROJECT/"
+cp -f build/railreverse.dll build/railreverse.ini art/button_*.png "$PROJECT/plugins/"
 echo "[deploy] $PROJECT"
