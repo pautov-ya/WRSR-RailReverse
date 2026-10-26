@@ -2,6 +2,12 @@
 
 # Changes
 
+## 0.6.1
+
+- Running round works when the wagons are left on the track of a building, such as a shunting yard asset: the signal before them lets the locomotive through.
+- No "trains cannot continue" warning when a locomotive leaves its wagons on such a track.
+- A locomotive running round goes on the same way after a save is loaded.
+
 ## 0.6.0
 
 - The mod is renamed Rail Operations (it was Rail Reverse). The file names (`railreverse.dll`, `railreverse.ini`) stay.

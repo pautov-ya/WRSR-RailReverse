@@ -19,7 +19,7 @@
 #include <wchar.h>
 #include <shlwapi.h>
 
-#define RR_VERSION "0.6.0"
+#define RR_VERSION "0.6.1"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -815,6 +815,15 @@ static void TypeName(BYTE* v, char* out)
     out[i] = 0;
 }
 
+// Locomotives running round their wagons (g_left), one line each:
+//   left <index in the vehicle list> <x> <y> <z> <metres run> <type folder>
+// x y z: the waypoint where it left them, found again in its schedule.
+struct LeftPending { int index; float at[3]; float run; char type[TYPE_NAME_MAX]; };
+static LeftPending    g_leftPending[LEFT_MAX];
+static int            g_leftPendingCount;
+static volatile LONG  g_leftPendingLive;
+static unsigned       g_leftPendingTries;
+
 static int  MarksText(char* out, int cap, int* count);   // the route window's uncouple marks, see below
 static void LoadMark(const char* text, int kind);
 static void ClearMarks(void);
@@ -845,10 +854,24 @@ static void SaveSidecar(const char* vehiclesBin)
                            (pushing ? 1 : 0) | (t->chosen ? 2 : 0) | (t->turned && pushing == t->pushing ? 4 : 0) | (t->hubLimit << 8), name);
         ++trains;
     }
+    int lefts = 0;
+    for (int k = 0; k < g_leftCount; ++k) {
+        const Left& l = g_left[k];
+        int i = 0;
+        while (i < n && veh[i] != l.loco) ++i;
+        if (i >= n) continue;                                // gone (sold)
+        float at[3] = { 0, 0, 0 };
+        if (l.wp) { Rd(l.wp, 4, &at[0]); Rd(l.wp, 8, &at[1]); Rd(l.wp, 12, &at[2]); }
+        char name[TYPE_NAME_MAX];
+        TypeName(l.loco, name);
+        len += _snprintf_s(buf + len, sizeof(buf) - len, _TRUNCATE, "left %d %.3f %.3f %.3f %.1f %s\n", i, at[0], at[1], at[2],
+                           l.run, name);
+        ++lefts;
+    }
     LeaveCriticalSection(&g_lock);
     int marks = 0;
     len += MarksText(buf + len, (int)sizeof(buf) - len, &marks);
-    if (!trains && !marks) {
+    if (!trains && !marks && !lefts) {
         DeleteFileA(path);                // nothing to remember: no stale file for the next load
         Logf("railreverse  save: nothing to remember");
         return;
@@ -858,7 +881,7 @@ static void SaveSidecar(const char* vehiclesBin)
     DWORD wrote = 0;
     WriteFile(h, buf, (DWORD)len, &wrote, 0);
     CloseHandle(h);
-    Logf("railreverse  save: %d train(s), %d stop mark(s) -> %s", trains, marks, path);
+    Logf("railreverse  save: %d train(s), %d stop mark(s), %d locomotive(s) running round -> %s", trains, marks, lefts, path);
 }
 
 static void LoadSidecar(const char* vehiclesBin)
@@ -872,6 +895,8 @@ static void LoadSidecar(const char* vehiclesBin)
     g_pendingLive = 0;
     g_allFreight = g_allPassenger = 0;               // until the Scripts menu flags are read
     g_leftCount = 0;
+    g_leftPendingCount = 0;
+    g_leftPendingLive = 0;
     ClearMarks();
     ClearWatch();
     g_standCount = 0;
@@ -902,6 +927,14 @@ static void LoadSidecar(const char* vehiclesBin)
             LoadMark(line + 9, 0);
         } else if (!strncmp(line, "reverse ", 8)) {
             LoadMark(line + 8, 1);
+        } else if (!strncmp(line, "left ", 5)) {
+            LeftPending l = {};
+            int used = 0;
+            if (g_leftPendingCount < LEFT_MAX &&
+                sscanf(line + 5, "%d %f %f %f %f %n", &l.index, &l.at[0], &l.at[1], &l.at[2], &l.run, &used) == 5 && used > 0) {
+                strncpy(l.type, line + 5 + used, TYPE_NAME_MAX - 1);
+                g_leftPending[g_leftPendingCount++] = l;
+            }
         } else if (g_pendingCount < 512) {
             char* a = strchr(line, ' ');
             char* b = a ? strchr(a + 1, ' ') : 0;
@@ -918,8 +951,56 @@ static void LoadSidecar(const char* vehiclesBin)
     }
     g_pendingTries = 0;
     g_pendingLive = g_pendingCount;
+    g_leftPendingTries = 0;
+    g_leftPendingLive = g_leftPendingCount;
     LeaveCriticalSection(&g_lock);
-    Logf("railreverse  load: %d train(s) to restore from %s", g_pendingCount, path);
+    Logf("railreverse  load: %d train(s), %d locomotive(s) running round to restore from %s", g_pendingCount,
+         g_leftPendingCount, path);
+}
+
+// The waypoint of a train's schedule at x y z (0: none there now).
+static BYTE* ScheduleWaypointAt(BYTE* lead, const float* at)
+{
+    BYTE *sb = 0, *se = 0, *recs = 0;
+    Rd(lead, 0x680, &sb); Rd(lead, 0x688, &se); Rd(lead, 0x638, &recs);
+    int n = sb && se > sb ? (int)((se - sb) / 8) : 0;
+    if (!recs || !ReadablePtr(sb, (size_t)n * 8)) return 0;
+    for (int i = 0; i < n; ++i) {
+        BYTE* wp = 0;
+        float p[3];
+        if (((BYTE**)sb)[i] || !Rd(recs + (size_t)i * 0x198, 0x190, &wp) || !wp) continue;   // REC_SIZE, REC_WAYPOINT
+        if (!Rd(wp, 4, &p[0]) || !Rd(wp, 8, &p[1]) || !Rd(wp, 12, &p[2])) continue;
+        float dx = p[0] - at[0], dy = p[1] - at[1], dz = p[2] - at[2];
+        if (dx * dx + dy * dy + dz * dz < 1.0f) return wp;
+    }
+    return 0;
+}
+
+// Like RestorePending: the locomotives running round go back on the list.
+static void RestoreLeft(void)
+{
+    BYTE** veh = 0;
+    int n = VehicleCount(&veh), restored = 0, left = 0;
+    EnterCriticalSection(&g_lock);
+    for (int k = 0; k < g_leftPendingCount; ++k) {
+        LeftPending* p = &g_leftPending[k];
+        if (p->index < 0 || p->index >= n) continue;
+        BYTE* v = veh[p->index];
+        if (!IsLoco(v)) continue;
+        char name[TYPE_NAME_MAX];
+        TypeName(v, name);
+        if (strcmp(name, p->type) != 0) continue;
+        LeftAdd(v, ScheduleWaypointAt(v, p->at));
+        LeftOf(v)->run = p->run;
+        p->index = -1;
+        ++restored;
+    }
+    for (int k = 0; k < g_leftPendingCount; ++k) if (g_leftPending[k].index >= 0) ++left;
+    bool giveUp = ++g_leftPendingTries > 20000;
+    if (!left || giveUp) g_leftPendingLive = 0;
+    LeaveCriticalSection(&g_lock);
+    if (restored) Logf("railreverse  load: %d locomotive(s) running round restored", restored);
+    if (giveUp && left) Logf("railreverse  load: %d locomotive(s) running round not found, dropped", left);
 }
 
 // Runs from the placement hook, i.e. once the world is drawn, until every
@@ -1519,6 +1600,17 @@ static bool ChainAt(BYTE* node)
 
 static bool StandingWagons(BYTE* v);
 
+// The same node, or one at the same place (x, y, z at +4, +8, +12): a
+// building's track has nodes of its own where it meets the network.
+static bool NodesMeet(BYTE* a, BYTE* b)
+{
+    if (a == b) return true;
+    float p[3], q[3];
+    for (int i = 0; i < 3; ++i) if (!Rd(a, 4 + 4 * i, &p[i]) || !Rd(b, 4 + 4 * i, &q[i])) return false;
+    float dx = p[0] - q[0], dy = p[1] - q[1], dz = p[2] - q[2];
+    return dx * dx + dy * dy + dz * dz < 1.0f;
+}
+
 static BYTE* g_watch;
 static void ClearWatch(void) { g_watch = 0; }
 
@@ -1635,6 +1727,10 @@ static char HookSignal(BYTE* lead)
         if (SignalAt(((BYTE**)nb)[j]) && !ChainAt(((BYTE**)nb)[j])) past = ((BYTE**)nb)[j];
     BYTE* block[64];
     int nblock = 0;
+    // the nodes the walk went through: a building's own track (a shunting yard
+    // asset) ends at such a node but is not in its list of segments
+    BYTE* reached[64];
+    int nreached = 0;
     block[nblock++] = ((BYTE**)gb)[idx];
     for (int q = 0; q < nblock; ++q) {
         for (int end = 0; end < 2; ++end) {
@@ -1647,6 +1743,9 @@ static char HookSignal(BYTE* lead)
                 if (!seen && g_walkStopCount < 8) g_walkStops[g_walkStopCount++] = node;
                 continue;
             }
+            bool known = false;
+            for (int k = 0; k < nreached && !known; ++k) known = reached[k] == node;
+            if (!known && nreached < 64) reached[nreached++] = node;
             BYTE *sb = 0, *se = 0;
             if (!Rd(node, 0x28, &sb) || !Rd(node, 0x30, &se) || !sb || se <= sb || !ReadablePtr(sb, (size_t)(se - sb))) continue;
             for (BYTE** sp = (BYTE**)sb; sp < (BYTE**)se && nblock < 64; ++sp) {
@@ -1676,6 +1775,32 @@ static char HookSignal(BYTE* lead)
             if (!seg || (k >= 0 && rest >= 0.0f)) break;
             if (k >= 0) rest += SegLength(seg);
             for (int b = 0; b < nblock && !there; ++b) there = seg == block[b];
+            // a building's track: one of its ends is where the walk went through
+            for (int e = 0; e < 2 && !there; ++e) {
+                BYTE* node = 0;
+                if (!Rd(seg, e ? 0x28 : 0x20, &node) || !node) continue;
+                for (int r = 0; r < nreached && !there; ++r) there = NodesMeet(reached[r], node);
+            }
+        }
+        if (!there && cfg.research && StandingWagons(v)) {
+            static DWORD last;
+            if (GetTickCount() - last > 1000) {
+                last = GetTickCount();
+                BYTE *seg = *(BYTE**)(v + V_SEGMENT), *n[2] = {};
+                float p[2][3] = {};
+                if (seg) { Rd(seg, 0x20, &n[0]); Rd(seg, 0x28, &n[1]); }
+                for (int e = 0; e < 2; ++e) if (n[e]) { Rd(n[e], 4, &p[e][0]); Rd(n[e], 8, &p[e][1]); Rd(n[e], 12, &p[e][2]); }
+                char line[800];
+                int len = _snprintf_s(line, sizeof(line), _TRUNCATE, "railreverse  [signal]   wagons %p on %p (ends %p at %.1f %.1f %.1f, "
+                                      "%p at %.1f %.1f %.1f) not in the block; walk reached:", v, seg, n[0], p[0][0], p[0][1], p[0][2],
+                                      n[1], p[1][0], p[1][1], p[1][2]);
+                for (int r = 0; r < nreached && len > 0 && len < 700; ++r) {
+                    float q[3] = {};
+                    Rd(reached[r], 4, &q[0]); Rd(reached[r], 8, &q[1]); Rd(reached[r], 12, &q[2]);
+                    len += _snprintf_s(line + len, sizeof(line) - len, _TRUNCATE, " %p at %.1f %.1f %.1f", reached[r], q[0], q[1], q[2]);
+                }
+                Logf("%s", line);
+            }
         }
         if (!there) continue;
         if (!StandingWagons(v)) {                          // a train: wait, as the game says
@@ -1692,6 +1817,25 @@ static char HookSignal(BYTE* lead)
              "(%d segments)", lead, wagons, nblock);
     }
     return 1;
+}
+
+// The rail update (FUN_1406a7520) warns "trains cannot go on" (FUN_1404cc320,
+// kind 1) when a slow train has another ahead whose blocks hold its segment.
+// A locomotive running round and the wagons it left share the long track of a
+// building (a shunting yard asset) right after the uncoupling: not a jam. The
+// one call site is redirected; the 5th argument is the train (+0x390).
+static const short SIG_JAM_CALL[] = {     // mov rax,[rsi+390h]; mov [rsp+20h],rax; mov r9d,1; mov r8d,r9d; lea rcx,world; call
+    0x48,0x8b,0x86,0x90,0x03,0x00,0x00, 0x48,0x89,0x44,0x24,0x20, 0x41,0xb9,0x01,0x00,0x00,0x00, 0x45,0x8b,0xc1,
+    0x48,0x8d,0x0d,-1,-1,-1,-1, 0xe8,-1,-1,-1,-1, 0x44,0x88,0xae,0x98,0x17,0x00,0x00,
+};
+#define JAM_CALL_AT  28
+typedef void (*FnWarn)(BYTE* world, void* pos, int kind, int mode, BYTE* train, float radius, void* a7, void* a8);
+static FnWarn g_origWarn;
+
+static void HookJamWarning(BYTE* world, void* pos, int kind, int mode, BYTE* train, float radius, void* a7, void* a8)
+{
+    if (train && cfg.shunting && (LeftOf(train) || StandingWagons(train))) return;
+    g_origWarn(world, pos, kind, mode, train, radius, a7, a8);
 }
 
 static unsigned long long HookPlan(BYTE* lead, char a, char b, void* c)
@@ -1941,6 +2085,7 @@ static void MarkedStop(BYTE* lead, const float* at3);
 static void HookXform(BYTE* v, float* pos, float yaw, float pitch)
 {
     if (g_pendingLive) RestorePending();
+    if (g_leftPendingLive) RestoreLeft();
     if (g_marksPending) ResolveMarks();
     if (cfg.shunting && g_standScan) StandScan();
     if (g_standCount) StandCheck();
@@ -3517,6 +3662,24 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         else
             Logf("railreverse  way planner not hooked: light locomotives wait at signals before wagons");
         Hook(SIG(SIG_SIGNAL), SIGNAL_STOLEN, (void*)HookSignal, (void**)&g_origSignal, "signal check");
+        // no "trains cannot go on" warning for a locomotive running round and its wagons
+        if (BYTE* jam = FindUnique(SIG(SIG_JAM_CALL))) {
+            BYTE* at = jam + JAM_CALL_AT;
+            BYTE* hop = AllocNear(at, 16);
+            if (hop) {
+                g_origWarn = (FnWarn)(at + 5 + *(INT32*)(at + 1));
+                hop[0] = 0xFF; hop[1] = 0x25; *(INT32*)(hop + 2) = 0;
+                *(void**)(hop + 6) = (void*)HookJamWarning;
+                DWORD old;
+                VirtualProtect(at, 5, PAGE_EXECUTE_READWRITE, &old);
+                *(INT32*)(at + 1) = (INT32)(hop - (at + 5));
+                VirtualProtect(at, 5, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), at, 5);
+                Logf("railreverse  jam warning: call at +%06llX redirected", (unsigned long long)(at - g_exeBase));
+            }
+        } else {
+            Logf("railreverse  jam warning: call site not found");
+        }
         Logf("railreverse  uncouple test (CTRL+F11): %s, couple %s, obstacle lookup %s", g_split ? "on" : "split not found",
              g_couple3 ? "on" : "not found",
              memcmp(g_exeBase + RVA_VEHICLE_AT, VEHICLE_AT_HEAD, sizeof(VEHICLE_AT_HEAD)) ? "not found" : "on");
