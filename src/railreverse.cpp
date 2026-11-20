@@ -19,7 +19,7 @@
 #include <wchar.h>
 #include <shlwapi.h>
 
-#define RR_VERSION "0.6.1"
+#define RR_VERSION "0.6.2"
 #define RR_INI     "plugins\\railreverse.ini"
 
 // ---------------------------------------------------------------- layout (1.1.1.9)
@@ -49,8 +49,10 @@
 #define W_OBJECT       0x240      // what the window shows
 #define W_KIND         0x248      // int: 0 building, 1 vehicle, ...
 #define WINDOW_VEHICLE 1
-#define RVA_UI_SCALE   0x992088   // float, 1.1.1.9 (DockDistributionOffice, ForceNodes)
-#define RVA_WORLD      0x9D4F10   // DAT_1409d4f10, what the game passes as the world
+// Game globals, found at start-up through the code that uses them (see
+// FindRefs); 0 when not found, and what needs one stays off.
+static BYTE* g_uiScale;   // float (DockDistributionOffice, ForceNodes use it too)
+static BYTE* g_world;     // what the game passes as the world
 
 // ---------------------------------------------------------------- signatures
 // The flip: mov r11,rsp; push rbp; push rbx; lea rbp,[r11-0x458]; sub rsp,0x548 (19 B stolen) ...
@@ -182,8 +184,6 @@ static struct {
 // A train pushes after a reversal if it was chosen in its window, or if every
 // train of its class (freight / passenger) is switched on.
 static volatile LONG g_allFreight, g_allPassenger;   // from the Scripts menu flags (ScriptFlags)
-#define BUILD_1119 0x6A3EB6ADu          // SOVIET64.exe 1.1.1.9: its PE time stamp
-static bool g_build119;                 // the fixed addresses below are this build's
 static int g_allForced;                 // no train window to switch anything in: every train reverses
 static volatile LONG g_iconsStale;      // a save was loaded: the game let go of the textures it had
 static volatile LONG g_flagsStale = 1;  // a save was loaded: the Scripts menu flags are read afresh
@@ -1443,7 +1443,7 @@ static void StandCheck(void)
         if (!alive && g_blockState) {                                      // sold: the signals around it afresh
             BYTE* sig[16];
             int ns = BlockSignals(st.segs, st.n, sig, 16);
-            for (int k = 0; k < ns; ++k) g_blockState(g_exeBase + RVA_WORLD, sig[k], 1, 1);
+            for (int k = 0; k < ns && g_world; ++k) g_blockState(g_world, sig[k], 1, 1);
             Logf("railreverse  [stop] wagons %p gone (sold): %d signal(s) around them worked out again", st.v, ns);
         }
         g_stand[i] = g_stand[--g_standCount];                             // gone, or coupled: no more watching
@@ -1516,11 +1516,11 @@ static void Uncouple(BYTE* lead)
 
 
 // The game's obstacle lookup: the car at a point of a track segment
-// (FUN_1405219e0, its map at DAT_1409e4818). 1.1.1.9 addresses (off on another build).
-#define RVA_VEHICLE_AT 0x5219E0
-#define RVA_TRACK_MAP  0x9E4818
+// (FUN_1405219e0 in 1.1.1.9, its map at DAT_1409e4818).
 typedef BYTE* (*FnVehicleAt)(void* map, BYTE* seg, char dir, float at, void* node, int index);
-static const BYTE VEHICLE_AT_HEAD[] = { 0x48,0x89,0x5c,0x24,0x20, 0x48,0x89,0x4c,0x24,0x08, 0x55,0x56,0x57, 0x48,0x83,0xec,0x60 };
+static const short SIG_VEHICLE_AT[] = { 0x48,0x89,0x5c,0x24,0x20, 0x48,0x89,0x4c,0x24,0x08, 0x55,0x56,0x57, 0x48,0x83,0xec,0x60 };
+static FnVehicleAt g_vehicleAt;
+static BYTE* g_trackMap;
 
 static const short SIG_COUPLE[] = {     // FUN_1403fe3c0(_, a, b): b and its wagons go behind a's
     0x48,0x85,0xd2, 0x0f,0x84,-1,-1,-1,-1, 0x4c,0x89,0x44,0x24,0x18, 0x48,0x89,0x4c,0x24,0x08, 0x41,0x56,
@@ -1922,13 +1922,13 @@ static unsigned long long HookPlan(BYTE* lead, char a, char b, void* c)
 // The car this far in front of a lead (the game looks 1.5 m, 6.5 m, ... 31.5 m ahead).
 static BYTE* AheadAt(BYTE* lead, float ahead, float* at)
 {
-    if (memcmp(g_exeBase + RVA_VEHICLE_AT, VEHICLE_AT_HEAD, sizeof(VEHICLE_AT_HEAD)) != 0) return 0;
+    if (!g_vehicleAt || !g_trackMap) return 0;
     BYTE* seg = 0;
     float pos = 0.0f;
     if (!Rd(lead, V_SEGMENT, &seg) || !seg || !Rd(lead, V_SEGMENT_POS, &pos)) return 0;
     char dir = (char)*(lead + V_SEGMENT_DIR);
     *at = dir ? SegLength(seg) - pos - ahead : pos + ahead;
-    return ((FnVehicleAt)(g_exeBase + RVA_VEHICLE_AT))(*(void**)(g_exeBase + RVA_TRACK_MAP), seg, dir, *at, 0, 0);
+    return g_vehicleAt(*(void**)g_trackMap, seg, dir, *at, 0, 0);
 }
 
 static BYTE* AheadOf(BYTE* lead, float* at) { return AheadAt(lead, 1.5f, at); }
@@ -2276,13 +2276,12 @@ static void ReloadIndicatorSettings(void)
 }
 
 // The screen the UI is drawn on, in pixels: the game's own width/height
-// (1.1.1.9 globals, also used by ForceNodes), else the game window's client area.
-#define RVA_SCREEN_W 0x99528C
-#define RVA_SCREEN_H 0x995274
+// (globals also used by ForceNodes), else the game window's client area.
+static BYTE *g_screenW, *g_screenH;
 static bool ScreenSize(float* w, float* h)
 {
     int sw = 0, sh = 0;
-    if (Rd(g_exeBase, RVA_SCREEN_W, &sw) && Rd(g_exeBase, RVA_SCREEN_H, &sh) &&
+    if (Rd(g_screenW, 0, &sw) && Rd(g_screenH, 0, &sh) &&
         sw >= 320 && sh >= 200 && sw <= 20000 && sh <= 20000) {
         *w = (float)sw; *h = (float)sh;
         return true;
@@ -2316,7 +2315,7 @@ static void Indicator(BYTE* lead, int chosen, int pushing, int turned, int limit
     ReloadIndicatorSettings();
     if (!g_font) return;
     float scale = 1.0f;
-    Rd(g_exeBase, RVA_UI_SCALE, &scale);
+    Rd(g_uiScale, 0, &scale);
     if (!(scale > 0.25f && scale < 8.0f)) scale = 1.0f;
     float lineH = (g_fontPx > 0.0f ? g_fontPx * 1.25f : 18.0f * scale);
     float sw, sh;
@@ -2474,7 +2473,7 @@ static bool ScriptNamed(BYTE* script, const wchar_t* name)
 
 static void ScriptFlags(void)
 {
-    if (!g_build119) return;
+    if (!g_world) return;
     static DWORD last;
     static int freightWas = -1, passengerWas = -1;      // -1: not logged since the load
     DWORD now = GetTickCount();
@@ -2482,7 +2481,7 @@ static void ScriptFlags(void)
     last = now;
     if (InterlockedExchange(&g_flagsStale, 0)) freightWas = passengerWas = -1;
     BYTE *b = 0, *e = 0;
-    BYTE* world = g_exeBase + RVA_WORLD;
+    BYTE* world = g_world;
     if (!Rd(world, WORLD_SCRIPTS, &b) || !Rd(world, WORLD_SCRIPTS + 8, &e) || (b && e < b) || e - b > 8 * 4096) return;
     int n = b ? (int)((e - b) / 8) : 0;
     if (n && !ReadablePtr(b, (size_t)n * 8)) return;
@@ -2508,7 +2507,7 @@ static void ScriptFlags(void)
 // FUN_1407cff50): +0x264 the selected stop, +0x270 the route being shown;
 // route +0x210 stops (vector of building*, 0 for a waypoint), +0x228 a record
 // per stop (0x198 bytes, +0x190 the waypoint for a stop without a building).
-// 1.1.1.9 addresses (off on another build).
+// Function names as in 1.1.1.9.
 static const short SIG_ROUTE_CALL[] = {   // cmp ecx,8; jne; mov rdx,rsi; mov rcx,rdi; call FUN_1407cff50; jmp
     0x83,0xf9,0x08, 0x75,0x10, 0x48,0x8b,0xd6, 0x48,0x8b,0xcf, 0xe8,-1,-1,-1,-1, 0xe9,-1,-1,-1,-1, 0x83,0xf9,0x0a, 0x75,
 };
@@ -2520,14 +2519,15 @@ static const short SIG_ROUTE_CALL[] = {   // cmp ecx,8; jne; mov rdx,rsi; mov rc
 #define R_RECORDS      0x228
 #define REC_SIZE       0x198
 #define REC_WAYPOINT   0x190
-#define RVA_INPUT      0xA54B90   // C3D_INPUT, as FUN_1407cff50 uses it
-#define RVA_CLICK      0xA54E91   // u8: a left click this frame, cleared by whoever takes it
-#define RVA_PANEL      0x9BE060   // the C3D_PANEL2D the windows draw their buttons with
-#define RVA_PANEL_SIZE 0x9BE2E8   // float w, h
-#define RVA_PANEL_POS  0x9BE2F0   // float x, y; then a dword 0
-#define RVA_PANEL_RGBA 0x9BE30C   // float r, g, b, a
-#define RVA_SAMPLER    0x9EAD08   // what a texture is bound with
-#define RVA_MIDDLE     0x9EACD0   // C3D_MIDDLEPOINT: makes textures
+static BYTE* g_input;      // C3D_INPUT, as FUN_1407cff50 uses it
+static BYTE* g_click;      // u8: a left click this frame, cleared by whoever takes it
+static BYTE* g_rclick;     // u8: a right click this frame (left down/click, right down/click in a row)
+static BYTE* g_panel;      // the C3D_PANEL2D the windows draw their buttons with
+static BYTE* g_panelSize;  // float w, h
+static BYTE* g_panelPos;   // float x, y; then a dword 0
+static BYTE* g_panelRgba;  // float r, g, b, a
+static BYTE* g_sampler;    // what a texture is bound with
+static BYTE* g_middle;     // C3D_MIDDLEPOINT: makes textures
 #define UI_TOOLTIP     0xD5A0     // ui: wchar_t tooltip of what is under the mouse
 #define W_ACTIVE       0x20       // u8: the window takes the mouse
 #define EXP_MOUSE      "?GetMouseSolid@C3D_INPUT@@QEAA?AVC3DVECTOR3@@XZ"
@@ -2758,7 +2758,7 @@ static void* SelectedStop(BYTE* window, int* idx, int* count, BYTE** route, BYTE
 // small icon at its right end, drawn by the same panel (scrolled and clipped
 // with the row).
 #define EXP_9PATCH   "?DrawFrom9Patch@C3D_PANEL2D@@QEAAXUC3DRECT@@MMMMMM@Z"
-#define RVA_ROW_DRAW 0x7D261C         // the return address of the stop rows' call
+static BYTE* g_rowDraw;               // the return address of the stop rows' call
 typedef void (*Fn9Patch)(void* panel, int* rect, float a, float b, float c, float d, float e, float f);
 static Fn9Patch g_orig9Patch;
 static BYTE* g_rowWindow;             // the route window being drawn, its next row
@@ -2768,7 +2768,7 @@ static void  RowIcon(BYTE* window, int idx, const int* rect);
 static void Hook9Patch(void* panel, int* rect, float a, float b, float c, float d, float e, float f)
 {
     g_orig9Patch(panel, rect, a, b, c, d, e, f);
-    if (g_rowWindow && rect && (BYTE*)__builtin_return_address(0) == g_exeBase + RVA_ROW_DRAW)
+    if (g_rowWindow && rect && g_rowDraw && (BYTE*)__builtin_return_address(0) == g_rowDraw)
         RowIcon(g_rowWindow, g_rowIdx++, rect);
 }
 
@@ -2805,7 +2805,7 @@ static bool LoadIcons(void)
         if (!PathRelativePathToA(path, media, FILE_ATTRIBUTE_DIRECTORY, full, 0)) strcpy(path, full);
         for (char* c = path; *c; ++c) if (*c == '\\') *c = '/';
         if (path[0] == '.' && path[1] == '/') memmove(path, path + 2, strlen(path + 2) + 1);
-        void* tex = g_texture(g_exeBase + RVA_MIDDLE, path);
+        void* tex = g_texture(g_middle, path);
         int err = tex ? ((FnLoad)(*(void***)tex)[2])(tex, path, 0, 0, 1, 0) : -1;   // 0: loaded (the game checks != 0)
         if (err) Logf("railreverse  icon %s not loaded (%d)", path, err);
         g_icons[i] = err ? 0 : tex;
@@ -2816,15 +2816,15 @@ static bool LoadIcons(void)
 
 static void DrawIcon(void* tex, float x, float y, float size, float alpha)
 {
-    ((FnBind)(*(void***)tex)[0x70 / 8])(tex, 0, *(void**)(g_exeBase + RVA_SAMPLER));
-    float* sz = (float*)(g_exeBase + RVA_PANEL_SIZE);
-    float* at = (float*)(g_exeBase + RVA_PANEL_POS);
-    float* rgba = (float*)(g_exeBase + RVA_PANEL_RGBA);
+    ((FnBind)(*(void***)tex)[0x70 / 8])(tex, 0, *(void**)g_sampler);
+    float* sz = (float*)g_panelSize;
+    float* at = (float*)g_panelPos;
+    float* rgba = (float*)g_panelRgba;
     sz[0] = sz[1] = size;
     at[0] = x; at[1] = y; *(int*)(at + 2) = 0;
     rgba[0] = rgba[1] = rgba[2] = 1.0f;
     rgba[3] = alpha;
-    g_panelDraw(g_exeBase + RVA_PANEL, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, true);
+    g_panelDraw(g_panel, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, true);
 }
 
 static void RowIcon(BYTE* window, int idx, const int* rect)
@@ -2835,7 +2835,7 @@ static void RowIcon(BYTE* window, int idx, const int* rect)
     void* key = StopAt(window, idx, &count, &route, &wp, &ord);
     if (!key || !LoadIcons()) return;
     float sc = 1.0f;
-    Rd(g_exeBase, RVA_UI_SCALE, &sc);
+    Rd(g_uiScale, 0, &sc);
     float size = sc * 30.0f, x = (float)rect[2] - sc * 60.0f;
     for (int kind = MARK_UNCOUPLE; kind <= MARK_REVERSE; ++kind) {
         if (MarkIndex(*(BYTE**)(window + W_ROUTE), key, wp, ord, kind) < 0) continue;
@@ -2852,7 +2852,7 @@ static void RouteButton(BYTE* ui, BYTE* window, int kind)
 {
     if (!LoadIcons()) return;
     float sc = 1.0f, wx = 0, wy = 0, ox = 0, oy = 0;
-    Rd(g_exeBase, RVA_UI_SCALE, &sc);
+    Rd(g_uiScale, 0, &sc);
     if (!Rd(window, W_POS_X, &wx) || !Rd(window, W_POS_Y, &wy) || !Rd(window, W_OFF_X, &ox) || !Rd(window, W_OFF_Y, &oy)) return;
     // the game's buttons: x0 + 20 * scale, 52 * scale apart, 50 * scale square, at y0 + 25 * scale.
     // "Delete all stops" comes third when the route (+1) and its copy have
@@ -2870,7 +2870,7 @@ static void RouteButton(BYTE* ui, BYTE* window, int kind)
     bool marked = key && MarkIndex(real, key, wp, ord, kind) >= 0;
 
     float m[3] = { 0, 0, 0 };
-    g_mouse(g_exeBase + RVA_INPUT, m);
+    g_mouse(g_input, m);
     // the panel's position is the button's centre
     bool hover = *(window + W_ACTIVE) && fabsf(m[0] - x) <= size / 2 && fabsf(m[1] - y) <= size / 2;
 
@@ -2900,7 +2900,7 @@ static void RouteButton(BYTE* ui, BYTE* window, int kind)
     wcsncpy((wchar_t*)(ui + UI_TOOLTIP), tips[T == &kRussian ? 0 : 1][kind][!key ? 0 : marked ? 2 : 1], 160);
     ((wchar_t*)(ui + UI_TOOLTIP))[159] = 0;
 
-    BYTE* click = g_exeBase + RVA_CLICK;
+    BYTE* click = g_click;
     if (!*click || !key) return;
     *click = 0;                                            // taken: nothing under the window gets it
     int i = MarkIndex(real, key, wp, ord, kind);
@@ -2922,12 +2922,11 @@ static void RouteButton(BYTE* ui, BYTE* window, int kind)
 // switches reversing for this train (as key_train), the lower one sets the
 // most wagons a supply base hands it (left click +1, right click -1; past
 // hub_limit_max and below 1: no limit). The keys keep working.
-#define RVA_RCLICK 0xA54E93           // u8: a right click this frame (0xA54E90/91 left down/click, 92/93 right)
 
 static bool Hover(BYTE* window, float x, float y, float size)
 {
     float m[3] = { 0, 0, 0 };
-    g_mouse(g_exeBase + RVA_INPUT, m);
+    g_mouse(g_input, m);
     return *(window + W_ACTIVE) && fabsf(m[0] - x) <= size / 2 && fabsf(m[1] - y) <= size / 2;
 }
 
@@ -2942,7 +2941,7 @@ static void WindowButtons(BYTE* ui, BYTE* window, BYTE* lead)
     if (!LoadIcons()) return;
     ReloadIndicatorSettings();
     float sc = 1.0f, wx = 0, wy = 0, ox = 0, oy = 0;
-    Rd(g_exeBase, RVA_UI_SCALE, &sc);
+    Rd(g_uiScale, 0, &sc);
     if (!(sc > 0.25f && sc < 8.0f)) sc = 1.0f;
     if (!Rd(window, W_POS_X, &wx) || !Rd(window, W_POS_Y, &wy) || !Rd(window, W_OFF_X, &ox) || !Rd(window, W_OFF_Y, &oy)) return;
     float size = sc * 50.0f, x = wx + ox + sc * cfg.buttonX, y1 = wy + oy + sc * cfg.buttonY, y2 = y1 + sc * 52.0f;
@@ -2973,8 +2972,8 @@ static void WindowButtons(BYTE* ui, BYTE* window, BYTE* lead)
              window, wx, wy, ox, oy, sc, x, y1, x, y2);
     }
     if (!h1 && !h2) return;
-    BYTE* click = g_exeBase + RVA_CLICK;
-    BYTE* rclick = g_exeBase + RVA_RCLICK;
+    BYTE* click = g_click;
+    BYTE* rclick = g_rclick;
     wchar_t tip[160];
     if (h1) {
         wchar_t kTrain[40];
@@ -3214,7 +3213,7 @@ static void TurnStop(BYTE* lead)
 // long before it gets there. For a marked one, with wagons on, that check is
 // answered "not yet": the train keeps heading for the waypoint, the game
 // brakes it to stand there as at the end of any way, and once it stands it
-// leaves its wagons and the check goes through. 1.1.1.9 (off on another build).
+// leaves its wagons and the check goes through.
 static const short SIG_PASS[] = {     // imul r8,rdx,198h; ...; cmp [r8+rdx+190h],rcx; jne; lea ecx,[r9+1]; mov [rsi+698h],ecx
     0x4c,0x69,0xc2,0x98,0x01,0x00,0x00, 0x48,0x8b,0x96,0x38,0x06,0x00,0x00, 0x48,0x8b,0x07, 0x48,0x8b,0x0c,0xc8,
     0x49,0x39,0x8c,0x10,0x90,0x01,0x00,0x00, 0x75,0x31, 0x41,0x8d,0x49,0x01, 0x89,0x8e,0x98,0x06,0x00,0x00,
@@ -3364,6 +3363,65 @@ static BYTE* FindUnique(const short* sig, size_t n)
 }
 
 #define SIG(x) x, sizeof(x) / sizeof(x[0])
+
+// Game globals by an instruction that uses them: each signature is a few whole
+// instructions with every RIP-relative and branch offset left open; the one
+// at `at` holds the global's displacement, the first open 4 bytes from there
+// (none of them has an immediate after it). Made to match 1.1.1.9 and 1.1.1.13.
+static const short SIG_UI_SCALE[] = { 0x48,0x8d,0x54,0x24,0x20,0xff,0x15,-1,-1,-1,-1,0xf3,0x0f,0x10,0x05,-1,-1,-1,-1,0x33,0xf6,0xf3,0x0f,0x10,0x35,-1,-1,-1,-1 };
+static const short SIG_WORLD[] = { 0x83,0xff,0x03,0x7d,-1,0xb2,0x01,0x48,0x8d,0x0d,-1,-1,-1,-1,0xe8,-1,-1,-1,-1,0xb2,0x01,0x48,0x8d,0x0d,-1,-1,-1,-1 };
+static const short SIG_TRACK_MAP[] = { 0x48,0x39,0x44,0x0e,0x30,0x75,-1,0x48,0x8b,0x0d,-1,-1,-1,-1,0xe8,-1,-1,-1,-1,0x48,0x8b,0x83,0x08,0x17,0x00,0x00 };
+static const short SIG_SCREEN_W[] = { 0x48,0x8d,0x0d,-1,-1,-1,-1,0xff,0x15,-1,-1,-1,-1,0x66,0x0f,0x6e,0x15,-1,-1,-1,-1,0x48,0x8d,0x0d,-1,-1,-1,-1,0x66,0x0f,0x6e,0x05,-1,-1,-1,-1,0x41,0x0f,0x28,0xcc };
+static const short SIG_SCREEN_H[] = { 0x66,0x0f,0x6e,0x15,-1,-1,-1,-1,0x48,0x8d,0x0d,-1,-1,-1,-1,0x66,0x0f,0x6e,0x05,-1,-1,-1,-1,0x41,0x0f,0x28,0xcc };
+static const short SIG_INPUT[] = { 0xc6,0x41,0x5b,0x00,0x48,0x8d,0x15,-1,-1,-1,-1,0x48,0x8d,0x0d,-1,-1,-1,-1,0xff,0x15,-1,-1,-1,-1,0x84,0xc0 };
+static const short SIG_CLICK[] = { 0x40,0x38,0x35,-1,-1,-1,-1,0x74,-1,0x39,0x77,0x48,0x7f,-1,0xc7,0x47,0x48,0x02,0x00,0x00,0x00 };
+static const short SIG_RCLICK[] = { 0x08,0x05,-1,-1,-1,-1,0x0f,0xb6,0x43,0x67,0x08,0x05,-1,-1,-1,-1,0x0f,0xb6,0x43,0x68,0x08,0x05,-1,-1,-1,-1 };
+static const short SIG_PANEL[] = { 0x48,0x8d,0x54,0x24,0x40,0xf3,0x0f,0x10,0x15,-1,-1,-1,-1,0x48,0x8d,0x0d,-1,-1,-1,-1,0xf3,0x0f,0x59,0x15,-1,-1,-1,-1 };
+static const short SIG_PANEL_SIZE[] = { 0x41,0x8b,0xc5,0x0f,0x28,0xce,0xf3,0x0f,0x11,0x05,-1,-1,-1,-1,0xf3,0x0f,0x11,0x05,-1,-1,-1,-1 };
+static const short SIG_PANEL_POS[] = { 0xf2,0x0f,0x11,0x05,-1,-1,-1,-1,0xe8,-1,-1,-1,-1,0x48,0x8d,0x54,0x24,0x40,0x48,0x8d,0x0d,-1,-1,-1,-1,0xff,0x15,-1,-1,-1,-1,0x41,0x0f,0x28,0xda,0x48,0x8d,0x0d,-1,-1,-1,-1,0x48,0x8b,0xd0,0x41,0x0f,0x28,0xd2,0xff,0x15,-1,-1,-1,-1,0x44,0x0f,0x28,0xb4,0x24,0x80,0x02,0x00,0x00,0x84,0xc0,0x74,-1 };
+static const short SIG_PANEL_RGBA[] = { 0x48,0x8d,0x54,0x24,0x40,0xf3,0x0f,0x10,0x15,-1,-1,-1,-1,0x48,0x8d,0x0d,-1,-1,-1,-1,0xf3,0x0f,0x59,0x15,-1,-1,-1,-1,0x0f,0x11,0x05,-1,-1,-1,-1,0xf3,0x0f,0x10,0x0b,0x0f,0x28,0xda,0xf3,0x0f,0x10,0x43,0x04,0xf3,0x0f,0x2c,0xc1 };
+static const short SIG_SAMPLER[] = { 0x48,0x8b,0x0d,-1,-1,-1,-1,0xba,0x21,0x00,0x00,0x00,0x4c,0x8b,0x05,-1,-1,-1,-1,0x48,0x8b,0x01 };
+static const short SIG_MIDDLE[] = { 0x48,0x8d,0x15,-1,-1,-1,-1,0x48,0x8d,0x0d,-1,-1,-1,-1,0xff,0x15,-1,-1,-1,-1,0x49,0x89,0x86,0x50,0x0f,0x00,0x00 };
+// the stop rows' call in the route window: the return address is at 20
+static const short SIG_ROW_DRAW[] = { 0x0f,0x28,0xda,0x48,0x8d,0x55,0xd0,0x48,0x8d,0x0d,-1,-1,-1,-1,0xff,0x15,-1,-1,-1,-1,0x45,0x84,0xe4 };
+#define ROW_DRAW_AT 20
+
+static BYTE* RefTarget(const short* sig, size_t n, size_t at, const char* name)
+{
+    BYTE* p = FindUnique(sig, n);
+    size_t d = at;
+    while (d + 4 <= n && !(sig[d] < 0 && sig[d + 1] < 0 && sig[d + 2] < 0 && sig[d + 3] < 0)) ++d;
+    if (!p || d + 4 > n) { Logf("railreverse  game global not found: %s", name); return 0; }
+    return p + d + 4 + *(INT32*)(p + d);
+}
+#define REF(x, at) RefTarget(SIG(SIG_##x), at, #x)
+
+static void FindRefs(void)
+{
+    g_uiScale   = REF(UI_SCALE, 11);
+    g_world     = REF(WORLD, 7);
+    g_trackMap  = REF(TRACK_MAP, 7);
+    g_screenW   = REF(SCREEN_W, 13);
+    g_screenH   = REF(SCREEN_H, 15);
+    g_input     = REF(INPUT, 11);
+    g_click     = REF(CLICK, 0);
+    g_rclick    = REF(RCLICK, 10);
+    g_panel     = REF(PANEL, 13);
+    g_panelSize = REF(PANEL_SIZE, 6);
+    g_panelPos  = REF(PANEL_POS, 0);
+    g_panelRgba = REF(PANEL_RGBA, 28);
+    g_sampler   = REF(SAMPLER, 12);
+    g_middle    = REF(MIDDLE, 7);
+    g_vehicleAt = (FnVehicleAt)FindUnique(SIG(SIG_VEHICLE_AT));
+    BYTE* row = FindUnique(SIG(SIG_ROW_DRAW));
+    g_rowDraw = row ? row + ROW_DRAW_AT : 0;
+    Logf("railreverse  game globals: world +%llX, UI scale +%llX, input +%llX, panel +%llX, obstacle lookup +%llX, "
+         "stop rows +%llX", g_world ? (unsigned long long)(g_world - g_exeBase) : 0ull,
+         g_uiScale ? (unsigned long long)(g_uiScale - g_exeBase) : 0ull, g_input ? (unsigned long long)(g_input - g_exeBase) : 0ull,
+         g_panel ? (unsigned long long)(g_panel - g_exeBase) : 0ull,
+         g_vehicleAt ? (unsigned long long)((BYTE*)g_vehicleAt - g_exeBase) : 0ull,
+         g_rowDraw ? (unsigned long long)(g_rowDraw - g_exeBase) : 0ull);
+}
 
 static bool Hook(const short* sig, size_t n, size_t stolen, void* detour, void** orig, const char* label)
 {
@@ -3570,18 +3628,20 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         cfg.windowButtons = cfg.shunting = 0;
         Logf("railreverse  train window buttons and shunting unavailable (engine exports missing)");
     }
-    // The buttons, the Scripts menu switches and shunting use fixed 1.1.1.9
-    // addresses besides their signatures (windows, input, the running
-    // scripts, the obstacle map): on another build of the game they stay off.
-    {
-        IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(g_exeBase + ((IMAGE_DOS_HEADER*)g_exeBase)->e_lfanew);
-        g_build119 = nt->FileHeader.TimeDateStamp == BUILD_1119;
-        if (!g_build119) {
-            cfg.windowButtons = cfg.shunting = 0;
-            Logf("railreverse  game build %08lX is not 1.1.1.9 (%08X): train window buttons, Scripts menu switches and "
-                 "shunting off, reversing works", (unsigned long)nt->FileHeader.TimeDateStamp, BUILD_1119);
-        }
+    // The buttons, the Scripts menu switches and shunting need game globals
+    // besides their functions (windows, input, the running scripts, the
+    // obstacle map): found through the code that uses them, whatever the build.
+    FindRefs();
+    if (cfg.windowButtons && (!g_uiScale || !g_input || !g_click || !g_rclick || !g_panel || !g_panelSize ||
+                              !g_panelPos || !g_panelRgba || !g_sampler || !g_middle)) {
+        cfg.windowButtons = 0;
+        Logf("railreverse  train window buttons off: a game global was not found");
     }
+    if (cfg.shunting && (!g_world || !g_trackMap || !g_vehicleAt)) {
+        cfg.shunting = 0;
+        Logf("railreverse  shunting off: the world or the obstacle lookup was not found");
+    }
+    if (!g_world) Logf("railreverse  Scripts menu switches off: the world was not found");
     if (!g_sample || !g_rotXY || !FindUnique(SIG(SIG_FLIP)) || !FindUnique(SIG(SIG_XFORM))) {
         Logf("railreverse  %s not found - nothing hooked",
              !g_sample ? "trail sampler" : !g_rotXY ? "C3DVec3GetRotationXY" : "flip or placement signature");
@@ -3682,7 +3742,7 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
         }
         Logf("railreverse  uncouple test (CTRL+F11): %s, couple %s, obstacle lookup %s", g_split ? "on" : "split not found",
              g_couple3 ? "on" : "not found",
-             memcmp(g_exeBase + RVA_VEHICLE_AT, VEHICLE_AT_HEAD, sizeof(VEHICLE_AT_HEAD)) ? "not found" : "on");
+             g_vehicleAt && g_trackMap ? "on" : "not found");
 
         // holding marked waypoints: the game's "waypoint passed" test calls RR_PassThunk
         if (BYTE* pass = FindUnique(SIG(SIG_PASS))) {
@@ -3706,7 +3766,9 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
 
         // the route window button: its one call site goes through a stub to RR_RouteWindow
         BYTE* site = FindUnique(SIG(SIG_ROUTE_CALL));
-        BYTE* stub = site && g_mouse && g_texture && g_panelDraw ? AllocNear(site, 16) : 0;
+        bool ui = g_mouse && g_texture && g_panelDraw && g_uiScale && g_input && g_click && g_rclick && g_panel &&
+                  g_panelSize && g_panelPos && g_panelRgba && g_sampler && g_middle;
+        BYTE* stub = site && ui ? AllocNear(site, 16) : 0;
         if (stub) {
             site += ROUTE_CALL_AT;
             g_origRoute = (FnRouteWindow)(site + 5 + *(INT32*)(site + 1));
@@ -3721,7 +3783,7 @@ extern "C" __declspec(dllexport) int TsmPluginStart(void)
             if (!PatchIat(g_exe, DLL_ENGINE, EXP_9PATCH, (void*)Hook9Patch, (void**)&g_orig9Patch, "railreverse 9-patch"))
                 Logf("railreverse  route window rows: no marks on the rows (9-patch import not patched)");
         } else {
-            Logf("railreverse  route window button unavailable (%s)", !site ? "call site not found" : "engine exports missing");
+            Logf("railreverse  route window button unavailable (%s)", !site ? "call site not found" : "engine exports or game globals missing");
         }
     }
     Logf("railreverse  ready");

@@ -22,7 +22,7 @@ All settings are kept in the save and in a file next to it; the save itself is n
 
 ## Requirements
 
-- Workers & Resources: Soviet Republic **1.1.1.9**, 64-bit.
+- Workers & Resources: Soviet Republic **1.1.1.9** or **1.1.1.13**, 64-bit.
 - [Republic Mod Loader](https://steamcommunity.com/sharedfiles/filedetails/?id=3787969749) (RML).
 - No DLC. Compatible with [RailPhysics](https://steamcommunity.com/sharedfiles/filedetails/?id=3776784867).
 
@@ -93,7 +93,7 @@ For reversing, the game still turns the train round as usual and the mod changes
 
 - When a supply base takes **all** the wagons of a pushing train, the locomotive jumps to where the first wagon was.
 - Wagons left at an uncouple stop stand as a train without a locomotive. Saved like that and loaded with a version of the mod before 0.6.0 or with `shunting = 0`, they can slow the game down badly until the game removes them. Let the locomotives couple back before going back to an older version.
-- Running round, the train window buttons and the Scripts menu switches work with game version 1.1.1.9 only. On another version they turn off; reversing keeps working.
+- Tested with game versions 1.1.1.9 and 1.1.1.13. On another version, a feature whose place in the game's code is not found turns off; reversing keeps working.
 
 ## Building
 

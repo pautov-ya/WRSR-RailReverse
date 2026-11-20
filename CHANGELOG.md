@@ -2,6 +2,10 @@
 
 # Changes
 
+## 0.6.2
+
+- Works with game version 1.1.1.13. The check for version 1.1.1.9 is gone: the mod finds what it needs in the game's code, and only a feature it cannot find turns off.
+
 ## 0.6.1
 
 - Running round works when the wagons are left on the track of a building, such as a shunting yard asset: the signal before them lets the locomotive through.
